@@ -80,6 +80,28 @@ struct WindowDragHandler: NSViewRepresentable {
 
 // MARK: - Helpers
 
+/// Uniform hover treatment for the small toolbar icon buttons (pin, close,
+/// back, reveal-in-Finder, add-workspace): a soft rounded highlight that
+/// fades in/out instead of each button hand-rolling its own background.
+struct IconHover: ViewModifier {
+    @State private var isHovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .padding(4)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(isHovering ? Color.primary.opacity(0.10) : Color.clear)
+            )
+            .animation(.easeOut(duration: 0.12), value: isHovering)
+            .onHover { isHovering = $0 }
+    }
+}
+
+extension View {
+    func iconHover() -> some View { modifier(IconHover()) }
+}
+
 func isMouseInsideWindow() -> Bool {
     guard let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "FolderShelfWindow" }),
           window.isVisible else { return false }
@@ -124,6 +146,8 @@ class AppStore: ObservableObject {
         workspaces.removeAll(where: { $0.id == ws.id })
         if selectedWorkspaceID == ws.id {
             selectedWorkspaceID = workspaces.first?.id
+            // Don't leave the folder selection dangling inside the deleted workspace.
+            selectedFolderID = selectedWorkspace?.folders.first?.id
         }
         save()
     }
@@ -174,6 +198,9 @@ class AppStore: ObservableObject {
         } else {
             selectedWorkspaceID = workspaces.first?.id
         }
+        // Auto-select the first mounted folder so launching straight into a
+        // workspace shows its files instead of the empty placeholder.
+        selectedFolderID = selectedWorkspace?.folders.first?.id
     }
 }
 
@@ -201,38 +228,33 @@ struct MainView: View {
                 
                 // Horizontal Workspace tabs
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 6) {
                         ForEach(store.workspaces) { ws in
-                            Text(ws.name)
-                                .font(.system(size: 12, weight: store.selectedWorkspaceID == ws.id ? .semibold : .regular))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(store.selectedWorkspaceID == ws.id ? Color.primary.opacity(0.12) : Color.primary.opacity(0.04))
-                                .cornerRadius(6)
-                                .onTapGesture {
-                                    store.selectedWorkspaceID = ws.id
-                                    store.selectedFolderID = ws.folders.first?.id
-                                }
-                                .contextMenu {
-                                    if store.workspaces.count > 1 {
-                                        Button("删除工作区", role: .destructive) {
-                                            store.removeWorkspace(ws)
-                                        }
+                            WorkspaceTabView(name: ws.name,
+                                             isSelected: store.selectedWorkspaceID == ws.id) {
+                                store.selectedWorkspaceID = ws.id
+                                store.selectedFolderID = ws.folders.first?.id
+                            }
+                            .contextMenu {
+                                if store.workspaces.count > 1 {
+                                    Button("删除工作区", role: .destructive) {
+                                        store.removeWorkspace(ws)
                                     }
                                 }
+                            }
                         }
                     }
                 }
-                
+
                 // Add Workspace Button
                 Button(action: { showAddWorkspaceSheet = true }) {
                     Image(systemName: "plus")
                         .font(.system(size: 11, weight: .bold))
-                        .padding(5)
-                        .background(Color.primary.opacity(0.06))
-                        .cornerRadius(4)
+                        .foregroundColor(.secondary)
                 }
                 .buttonStyle(.plain)
+                .iconHover()
+                .help("新建工作区")
                 
                 Spacer()
                 
@@ -250,8 +272,9 @@ struct MainView: View {
                         .font(.system(size: 12))
                 }
                 .buttonStyle(.plain)
+                .iconHover()
                 .help(isPinned ? "窗口置顶已开启" : "开启窗口置顶")
-                
+
                 // Close button
                 Button(action: {
                     if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "FolderShelfWindow" }) {
@@ -263,7 +286,7 @@ struct MainView: View {
                         .font(.system(size: 14))
                 }
                 .buttonStyle(.plain)
-                .padding(.leading, 4)
+                .iconHover()
             }
             .padding(.top, 4) // Snug against absolute top of the screen
             .padding(.horizontal, 14)
@@ -320,7 +343,9 @@ struct MainView: View {
                     .buttonStyle(.plain)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
-                    .background(Color.blue)
+                    // System accent instead of hardcoded blue, so it matches
+                    // the user's macOS accent color setting.
+                    .background(Color.accentColor)
                     .foregroundColor(.white)
                     .cornerRadius(6)
                 }
@@ -331,11 +356,72 @@ struct MainView: View {
     }
 }
 
+// MARK: - Workspace Tab
+
+struct WorkspaceTabView: View {
+    let name: String
+    let isSelected: Bool
+    let onSelect: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Text(name)
+            .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+            .foregroundColor(isSelected ? .primary : .secondary)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 5)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.28)
+                          : (isHovering ? Color.primary.opacity(0.10) : Color.primary.opacity(0.05)))
+            )
+            .contentShape(Capsule(style: .continuous))
+            .animation(.easeOut(duration: 0.15), value: isHovering)
+            .onHover { isHovering = $0 }
+            .onTapGesture(perform: onSelect)
+    }
+}
+
 // MARK: - Sidebar View
+
+struct SidebarFolderRow: View {
+    let folder: FolderItem
+    let onRemove: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "folder.fill")
+                .foregroundColor(.blue)
+                .font(.system(size: 13))
+            Text(folder.displayName)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .font(.system(size: 13))
+            Spacer()
+
+            // Reveal the remove button only on hover — calmer rows, and no
+            // accidental clicks while scanning the list.
+            if isHovering {
+                Button(action: onRemove) {
+                    Image(systemName: "minus.circle.fill")
+                        .foregroundColor(.secondary)
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+                .help("移除该挂载目录")
+                .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.12), value: isHovering)
+        .onHover { isHovering = $0 }
+    }
+}
 
 struct SidebarView: View {
     @ObservedObject var store: AppStore
-    
+    @State private var isAddHovering = false
+
     var body: some View {
         VStack(spacing: 8) {
             Text("挂载目录")
@@ -352,22 +438,7 @@ struct SidebarView: View {
             List(selection: $store.selectedFolderID) {
                 if let folders = store.selectedWorkspace?.folders, !folders.isEmpty {
                     ForEach(folders) { folder in
-                        HStack {
-                            Image(systemName: "folder.fill")
-                                .foregroundColor(.blue)
-                                .font(.system(size: 13))
-                            Text(folder.displayName)
-                                .lineLimit(1)
-                                .font(.system(size: 13))
-                            Spacer()
-                            
-                            Button(action: { store.removeFolder(folder) }) {
-                                Image(systemName: "minus.circle")
-                                    .foregroundColor(.secondary)
-                                    .font(.system(size: 11))
-                            }
-                            .buttonStyle(.plain)
-                        }
+                        SidebarFolderRow(folder: folder) { store.removeFolder(folder) }
                         .listRowInsets(EdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6))
                         // Native sidebar selection now draws the highlight; keep the
                         // row background clear so we don't double-paint the selection.
@@ -387,10 +458,10 @@ struct SidebarView: View {
             .background(Color.clear)
             
             Spacer()
-            
+
             // Add Folder Button
             Button(action: addFolderDialog) {
-                HStack {
+                HStack(spacing: 6) {
                     Image(systemName: "plus.circle.fill")
                     Text("添加本地文件夹")
                 }
@@ -399,8 +470,12 @@ struct SidebarView: View {
                 .padding(.vertical, 8)
             }
             .buttonStyle(.plain)
-            .background(Color.primary.opacity(0.06))
-            .cornerRadius(6)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(isAddHovering ? Color.accentColor.opacity(0.22) : Color.primary.opacity(0.06))
+            )
+            .animation(.easeOut(duration: 0.12), value: isAddHovering)
+            .onHover { isAddHovering = $0 }
             .padding(.horizontal, 10)
             .padding(.bottom, 12)
         }
@@ -431,7 +506,8 @@ struct DetailView: View {
     @State private var searchText = ""
     @State private var selectedFileID: URL? = nil
     @State private var nameWidth: CGFloat = 200   // resizable; auto-expands to fill when the window is wide
-    @State private var viewMode: ViewMode = .list
+    // Persisted so the list/grid choice survives app restarts.
+    @AppStorage("FolderShelfViewMode") private var viewMode: ViewMode = .list
     @State private var sortField: SortField = .dateModified
     @State private var sortAscending = false
     
@@ -497,13 +573,12 @@ struct DetailView: View {
                         }) {
                             Image(systemName: "chevron.left")
                                 .font(.system(size: 11, weight: .bold))
-                               .foregroundColor(!atRoot ? .primary : .secondary)
-                                .padding(5)
-                                .background(Color.primary.opacity(0.04))
-                                .cornerRadius(4)
+                                .foregroundColor(!atRoot ? .primary : .secondary)
                         }
                         .buttonStyle(.plain)
+                        .iconHover()
                         .disabled(atRoot)
+                        .help("返回上一级")
                         
                         Text(current.lastPathComponent)
                             .font(.system(size: 14, weight: .bold))
@@ -516,6 +591,7 @@ struct DetailView: View {
                                 .font(.system(size: 11))
                         }
                         .buttonStyle(.plain)
+                        .iconHover()
                         .help("在访达中打开当前目录")
                     }
                 } else {
@@ -856,7 +932,8 @@ struct DetailView: View {
                             if FileManager.default.fileExists(atPath: dest.path) {
                                 let ext = sourceURL.pathExtension
                                 let base = sourceURL.deletingPathExtension().lastPathComponent
-                                let newName = "\(base)_副本.\(ext)"
+                                // No trailing dot for extension-less files/folders.
+                                let newName = ext.isEmpty ? "\(base)_副本" : "\(base)_副本.\(ext)"
                                 let newDest = destURL.appendingPathComponent(newName)
                                 try FileManager.default.copyItem(at: sourceURL, to: newDest)
                             } else {
@@ -989,9 +1066,12 @@ struct FileRowView: View {
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 6)
-        .background(isSelected ? Color.accentColor.opacity(0.25)
-                              : (isHovering ? Color.primary.opacity(0.08) : Color.clear))
-        .cornerRadius(4)
+        .background(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(isSelected ? Color.accentColor.opacity(0.25)
+                                 : (isHovering ? Color.primary.opacity(0.07) : Color.clear))
+        )
+        .animation(.easeOut(duration: 0.12), value: isHovering)
         .contentShape(Rectangle())
         .onHover { hovering in
             isHovering = hovering
@@ -1049,9 +1129,18 @@ struct FileCardView: View {
         }
         .frame(width: 75, height: 90)
         .padding(6)
-        .background(isSelected ? Color.accentColor.opacity(0.25)
-                              : (isHovering ? Color.primary.opacity(0.08) : Color.clear))
-        .cornerRadius(8)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(isSelected ? Color.accentColor.opacity(0.22)
+                                 : (isHovering ? Color.primary.opacity(0.07) : Color.clear))
+        )
+        // A hairline accent ring makes the selected card readable even when
+        // the fill blends into the dark background.
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(isSelected ? Color.accentColor.opacity(0.55) : Color.clear, lineWidth: 1)
+        )
+        .animation(.easeOut(duration: 0.12), value: isHovering)
         .contentShape(Rectangle())
         .onHover { hovering in
             isHovering = hovering
@@ -1225,13 +1314,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func showWindowOnScreen(_ screen: NSScreen) {
         guard let window = window else { return }
-        
-        // Align with the visible area of the target screen (snugly under the status bar / menu bar)
+
+        // Keep the user's resized panel dimensions (the panel is .resizable);
+        // only re-anchor it to the top-center of the target screen.
+        let size = window.frame.size
         let visibleRect = screen.visibleFrame
-        let x = visibleRect.origin.x + (visibleRect.width - 660) / 2
-        let y = visibleRect.origin.y + visibleRect.height - 440
-        
-        window.setFrame(NSRect(x: x, y: y, width: 660, height: 440), display: false)
+        let x = visibleRect.origin.x + (visibleRect.width - size.width) / 2
+        let y = visibleRect.origin.y + visibleRect.height - size.height
+
+        window.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: false)
         window.level = .floating
         // Show the panel above the active app WITHOUT activating FolderShelf, so
         // the menu bar / Ice stay interactive and a fullscreen app is not kicked out.
