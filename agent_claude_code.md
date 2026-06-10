@@ -118,3 +118,41 @@
 
 ### Open Questions
 - Boss's last message was cut off ("对了，然后……") — waiting for the rest.
+
+## Run: 2026-06-09 (round 5 — v0.2.0: bugfixes + UI polish + GitHub)
+
+### Task Understood
+- Boss: 找可提升点（UI 美化为主）、顺便修 bug、用 GitHub 做版本控制、重建并自己重启应用、打 tag 发 Release、收工更新 packet 文档。
+
+### Actions Taken
+- Verified the two historical bugs (sidebar drag-to-reorder, subfolder display name) are already fixed and live from rounds 1-4; no regression found in current source.
+- Fixed 4 new bugs in root `App.swift`:
+  1. `removeWorkspace` left `selectedFolderID` pointing into the deleted workspace; now resets to the new workspace's first folder.
+  2. `load()` restored the workspace but never selected a folder, so launch always showed the empty placeholder; now auto-selects the first mounted folder.
+  3. `showWindowOnScreen` hard-coded 660x440 on every show, discarding the user's manual resize (panel is `.resizable`); now preserves current size and only re-anchors top-center.
+  4. `handleDrop` duplicate naming produced `base_副本.` (trailing dot) for extension-less items; now conditional.
+- UI polish (7 items, all native SwiftUI, #292929 style and trigger/auto-hide logic untouched):
+  1. Workspace tabs → capsule shape, accent-tinted selection, hover state, easeOut animation (`WorkspaceTabView`).
+  2. New shared `IconHover` modifier; applied to pin / close / back / reveal-in-Finder / add-workspace icon buttons for one consistent soft rounded hover highlight.
+  3. Sidebar rows (`SidebarFolderRow`): remove button revealed only on hover, middle truncation for long names.
+  4. Add-folder button: accent hover state + continuous-corner rounding.
+  5. List rows / grid cards: 0.12s eased hover/selection transitions, continuous corners; selected grid card gets a hairline accent ring.
+  6. New-workspace sheet button uses `Color.accentColor` instead of hardcoded blue.
+  7. View mode (list/grid) persisted via `@AppStorage("FolderShelfViewMode")`.
+- Typecheck clean (only the pre-existing macOS 14 `onChange` deprecation warning). Built with `swiftc -parse-as-library -O`, quit app via osascript, replaced bundle binary, re-signed adhoc, relaunched — confirmed running (new PID) and stable after 3s.
+- Version control: `git init -b main`, `.gitignore` (excludes raw/ working/ final/ + binaries, keeps root md docs), baseline commit, then the v0.2.0 commit. Created public repo `hjinhao066/foldershelf` via gh CLI, pushed main, tagged `v0.2.0`, published GitHub Release with Chinese notes.
+- Synced root `App.swift` → `final/` + `working/claude_code/`; updated `02_STATUS.md` (Current State + History table).
+
+### Files Created Or Edited
+- root `App.swift`, `final/App.swift`, `working/claude_code/App.swift`, `.gitignore`, `02_STATUS.md`, `/Applications/FolderShelf.app` binary, this log.
+
+### Findings
+- The panel being `.resizable` but force-reset to 660x440 on every edge-trigger was the most user-visible annoyance among the new bugs.
+- `@AppStorage` works directly with the existing `ViewMode: String` enum — zero migration cost.
+
+### Recommended Coordinator Decision
+- Verify live: launch → first folder auto-selected; resize panel → re-trigger keeps size; hover sidebar row → minus button fades in; switch to grid → restart → still grid.
+- Repo: https://github.com/hjinhao066/foldershelf ; Release: https://github.com/hjinhao066/foldershelf/releases/tag/v0.2.0
+
+### Open Questions
+- Still deferred from round 2: Quick Look (space), keyboard arrow navigation, 新建文件夹 button, forward/back history. Want any in v0.3?
