@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# cowork packet large/sandbox dirs (md docs at root are kept)
+raw/
+working/
+final/
+
+# build artifacts
+FolderShelf
+*.o
+*.app
+build/
+.build/
