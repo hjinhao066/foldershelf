@@ -308,8 +308,8 @@ struct MainView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        // Solid dark gray background
-        .background(Color(red: 0.16, green: 0.16, blue: 0.16))
+        // Adaptive background that follows the system light/dark appearance
+        .background(Color(NSColor.windowBackgroundColor))
         .onHover { isHovering in
             // Hide automatically when the mouse exits the window, unless pinned
             if !isHovering && !isPinned {
@@ -728,7 +728,7 @@ struct DetailView: View {
         .frame(width: 48 + nameW + otherColumnsWidth, alignment: .leading)
         // Opaque base so the pinned header never shows the rows scrolling underneath it.
         .background(Color.primary.opacity(0.03))
-        .background(Color(red: 0.16, green: 0.16, blue: 0.16))
+        .background(Color(NSColor.windowBackgroundColor))
         .overlay(Divider(), alignment: .bottom)
         .contextMenu {
             Toggle("种类", isOn: $showType)
@@ -1193,7 +1193,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create Status Item (Menu Bar Icon)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "folder.fill.badge.gearshape", accessibilityDescription: "FolderShelf")
+            button.image = NSImage(systemSymbolName: "folder.fill.badge.gearshape", accessibilityDescription: "FolderTop")
             button.action = #selector(toggleWindow)
             button.target = self
         }
@@ -1235,8 +1235,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.level = .floating // Float above the active app; shown without activation
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         
-        // Solid dark gray background
-        window.backgroundColor = NSColor(red: 0.16, green: 0.16, blue: 0.16, alpha: 1.0)
+        // Adaptive background that follows the system light/dark appearance
+        window.backgroundColor = .windowBackgroundColor
         window.isOpaque = true
         window.hasShadow = true
         
