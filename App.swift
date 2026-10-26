@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import Quartz   // QLPreviewPanel (Quick Look)
 
 // MARK: - Models
 
@@ -159,6 +160,262 @@ func isMouseInsideWindow() -> Bool {
     return NSMouseInRect(NSEvent.mouseLocation, window.frame, false)
 }
 
+extension Notification.Name {
+    /// Posted each time the panel is popped up; the storage bar refreshes on it (no polling).
+    static let folderTopPanelDidShow = Notification.Name("FolderTopPanelDidShow")
+}
+
+// MARK: - Startup-disk storage
+
+struct StorageInfo: Equatable {
+    let name: String
+    let available: Int64
+    let total: Int64
+
+    /// Used share of the disk, clamped to 0...1 (0 when the total is unknown).
+    var usedFraction: Double {
+        guard total > 0 else { return 0 }
+        return min(max(Double(total - available) / Double(total), 0), 1)
+    }
+
+    var summary: String {
+        "\(name) 剩 \(Self.bytes(available)) / 共 \(Self.bytes(total))"
+    }
+
+    static func bytes(_ n: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
+    }
+
+    /// Reads the volume that holds `url` ("/" = the startup disk). "Important usage"
+    /// counts purgeable space as free, which is what Finder shows.
+    static func load(at url: URL = URL(fileURLWithPath: "/")) -> StorageInfo? {
+        let keys: Set<URLResourceKey> = [.volumeNameKey, .volumeTotalCapacityKey,
+                                         .volumeAvailableCapacityForImportantUsageKey]
+        guard let v = try? url.resourceValues(forKeys: keys),
+              let total = v.volumeTotalCapacity,
+              let avail = v.volumeAvailableCapacityForImportantUsage else { return nil }
+        return StorageInfo(name: v.volumeName ?? "启动盘", available: avail, total: Int64(total))
+    }
+}
+
+struct StorageBarView: View {
+    @State private var storage: StorageInfo? = StorageInfo.load()
+
+    var body: some View {
+        if let info = storage {
+            HStack(spacing: 8) {
+                Image(systemName: "internaldrive")
+                    .font(.system(size: 11))
+                    .foregroundColor(Theme.textSecondary)
+                Text(info.summary)
+                    .font(.system(size: 11))
+                    .foregroundColor(Theme.textSecondary)
+                    .lineLimit(1)
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.12))
+                    GeometryReader { geo in
+                        Capsule()
+                            .fill(info.usedFraction >= 0.9 ? Color.orange : Color.accentColor)
+                            .frame(width: geo.size.width * CGFloat(info.usedFraction))
+                    }
+                }
+                .frame(height: 4)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            // Refresh only when the panel pops up, never on a timer.
+            .onReceive(NotificationCenter.default.publisher(for: .folderTopPanelDidShow)) { _ in
+                storage = StorageInfo.load()
+            }
+        }
+    }
+}
+
+// MARK: - Quick Look (space bar)
+
+enum PreviewNav {
+    /// Next/previous index in a list of `count` rows, clamped at both ends.
+    static func step(from index: Int?, count: Int, forward: Bool) -> Int {
+        guard count > 0 else { return 0 }
+        guard let i = index else { return forward ? 0 : count - 1 }
+        return min(max(i + (forward ? 1 : -1), 0), count - 1)
+    }
+}
+
+final class PreviewController: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    static let shared = PreviewController()
+    private var urls: [URL] = []
+    private weak var hostWindow: NSWindow?
+    private var resignObserver: NSObjectProtocol?
+    /// Key handler (set by PreviewKeyCatcher). Used when the preview panel itself has key
+    /// focus: its remote view swallows keys before an NSEvent monitor sees them, so they
+    /// arrive through the panel delegate instead.
+    var keyHandler: ((NSEvent) -> Bool)?
+
+    private var panel: QLPreviewPanel? {
+        QLPreviewPanel.sharedPreviewPanelExists() ? QLPreviewPanel.shared() : nil
+    }
+    var isVisible: Bool { panel?.isVisible ?? false }
+    func owns(_ window: NSWindow?) -> Bool { window != nil && window === panel }
+
+    func show(_ urls: [URL], host: NSWindow?) {
+        guard !urls.isEmpty, let panel = QLPreviewPanel.shared() else { return }
+        self.urls = urls
+        hostWindow = host
+        panel.dataSource = self
+        panel.delegate = self
+        panel.hidesOnDeactivate = false      // FolderTop is never the active app
+        // One level above the folder panel (.floating), so the preview sits on top of it
+        // instead of underneath.
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+        panel.reloadData()
+        // Not makeKey: the folder panel keeps key focus, so space / Esc / arrows keep
+        // reaching it and no other app is deactivated.
+        panel.orderFrontRegardless()
+        if resignObserver == nil {
+            resignObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResignKeyNotification, object: panel, queue: .main
+            ) { [weak self] _ in self?.closeIfFocusLost() }
+        }
+    }
+
+    func update(_ urls: [URL]) {
+        guard isVisible, !urls.isEmpty else { return }
+        self.urls = urls
+        panel?.reloadData()
+        panel?.currentPreviewItemIndex = 0
+    }
+
+    func close() {
+        urls = []
+        guard isVisible else { return }
+        panel?.close()
+        // The panel can ignore a close issued mid-animation; retry once if it is still up.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.urls.isEmpty, self.isVisible else { return }
+            self.panel?.orderOut(nil)
+        }
+    }
+
+    /// Closes the preview unless the folder panel or the preview itself holds key focus.
+    func closeIfFocusLost() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isVisible else { return }
+            if self.hostWindow?.isKeyWindow == true || self.panel?.isKeyWindow == true { return }
+            self.close()
+        }
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
+        guard event.type == .keyDown else { return false }
+        return keyHandler?(event) ?? false
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { urls.count }
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+        urls[index] as NSURL
+    }
+}
+
+/// Invisible view that installs a key-down monitor for the window it lives in (and
+/// the Quick Look panel), so space / Esc / arrows work without a focused text control.
+struct PreviewKeyCatcher: NSViewRepresentable {
+    let onKey: (NSEvent) -> Bool
+    func makeNSView(context: Context) -> PreviewKeyCatcherNSView {
+        let v = PreviewKeyCatcherNSView()
+        v.onKey = onKey
+        PreviewController.shared.keyHandler = onKey
+        return v
+    }
+    func updateNSView(_ nsView: PreviewKeyCatcherNSView, context: Context) {
+        nsView.onKey = onKey
+        PreviewController.shared.keyHandler = onKey
+    }
+}
+
+final class PreviewKeyCatcherNSView: NSView {
+    var onKey: ((NSEvent) -> Bool)?
+    private var monitor: Any?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        removeMonitor()
+        guard window != nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self, let w = self.window,
+                  event.window === w || PreviewController.shared.owns(event.window) else { return event }
+            return self.onKey?(event) == true ? nil : event
+        }
+    }
+    private func removeMonitor() {
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+    }
+    deinit { removeMonitor() }
+}
+
+/// The folder panel hides through several paths (close button, hover-out, status item);
+/// closing the preview in orderOut covers them all.
+final class FolderPanel: NSPanel {
+    // A borderless panel refuses key status by default. Allow it so a row click can make it
+    // key (becomesKeyOnlyIfNeeded keeps plain hovering/showing from ever taking focus).
+    override var canBecomeKey: Bool { true }
+
+    override func orderOut(_ sender: Any?) {
+        super.orderOut(sender)
+        // The extra async pass covers a close the Quick Look panel ignores mid-hide.
+        PreviewController.shared.close()
+        DispatchQueue.main.async { PreviewController.shared.close() }
+    }
+}
+
+// MARK: - Theme
+
+/// One adaptive palette for the whole panel: three clearly separated surfaces
+/// (chrome / sidebar / content), high-contrast text and hairline separators that
+/// hold up in both light and dark mode.
+enum Theme {
+    private static func ns(_ light: UInt32, _ dark: UInt32) -> NSColor {
+        NSColor(name: nil) { ap in
+            let v = ap.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+            return NSColor(srgbRed: CGFloat((v >> 16) & 0xFF) / 255,
+                           green: CGFloat((v >> 8) & 0xFF) / 255,
+                           blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+        }
+    }
+    static let chromeNS = ns(0xEEF0F5, 0x13151A)    // top bar, bottom bar, window
+    static let sidebarNS = ns(0xF6F7FA, 0x181B21)
+    static let contentNS = ns(0xFFFFFF, 0x1F232B)
+    static let chrome = Color(nsColor: chromeNS)
+    static let sidebar = Color(nsColor: sidebarNS)
+    static let content = Color(nsColor: contentNS)
+    static let textPrimary = Color(nsColor: ns(0x14161A, 0xF3F5F9))
+    static let textSecondary = Color(nsColor: ns(0x4B5260, 0xB4BBC8))
+    static let textTertiary = Color(nsColor: ns(0x667085, 0x949CAB))
+    static let hairline = Color(nsColor: NSColor(name: nil) { ap in
+        ap.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(white: 1, alpha: 0.09) : NSColor(white: 0, alpha: 0.10)
+    })
+    static let folderBlue = Color(nsColor: ns(0x2F6FEB, 0x5AA2FF))
+}
+
+extension View {
+    /// Drops the List's own material so the Theme surface behind it shows through.
+    @ViewBuilder func hideListBackground() -> some View {
+        if #available(macOS 13.0, *) {
+            self.scrollContentBackground(.hidden)
+        } else {
+            self.background(Color.clear)
+        }
+    }
+}
+
+struct HairlineH: View {
+    var body: some View { Rectangle().fill(Theme.hairline).frame(height: 1) }
+}
+struct HairlineV: View {
+    var body: some View { Rectangle().fill(Theme.hairline).frame(width: 1) }
+}
+
 // MARK: - Data Store
 
 class AppStore: ObservableObject {
@@ -274,7 +531,7 @@ struct MainView: View {
                         .font(.system(size: 13))
                     Text("工作区:")
                         .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Theme.textSecondary)
                 }
                 
                 // Horizontal Workspace tabs
@@ -301,7 +558,7 @@ struct MainView: View {
                 Button(action: { showAddWorkspaceSheet = true }) {
                     Image(systemName: "plus")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Theme.textSecondary)
                 }
                 .buttonStyle(.plain)
                 .iconHover()
@@ -333,7 +590,7 @@ struct MainView: View {
                     }
                 }) {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Theme.textSecondary)
                         .font(.system(size: 14))
                 }
                 .buttonStyle(.plain)
@@ -344,23 +601,26 @@ struct MainView: View {
             .padding(.bottom, 8)
             .background(WindowDragHandler())
             
-            Divider()
+            HairlineH()
             
             // Bottom Content
             HStack(spacing: 0) {
                 // Left Sidebar (Folders list)
                 SidebarView(store: store)
                     .frame(width: 180)
+                    .background(Theme.sidebar)
                 
-                Divider()
+                HairlineV()
                 
                 // Right Detail (File Browser)
                 DetailView(store: store)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+
+            HairlineH()
+            StorageBarView()
         }
-        // Adaptive background that follows the system light/dark appearance
-        .background(Color(NSColor.windowBackgroundColor))
+        .background(Theme.chrome)
         .onHover { isHovering in
             // Hide automatically when the mouse exits the window, unless pinned
             if !isHovering && !isPinned {
@@ -418,13 +678,13 @@ struct WorkspaceTabView: View {
     var body: some View {
         Text(name)
             .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
-            .foregroundColor(isSelected ? .primary : .secondary)
+            .foregroundColor(isSelected ? .white : Theme.textSecondary)
             .padding(.horizontal, 11)
             .padding(.vertical, 5)
             .background(
                 Capsule(style: .continuous)
-                    .fill(isSelected ? Color.accentColor.opacity(0.28)
-                          : (isHovering ? Color.primary.opacity(0.10) : Color.primary.opacity(0.05)))
+                    .fill(isSelected ? Color.accentColor
+                          : (isHovering ? Color.primary.opacity(0.12) : Color.primary.opacity(0.06)))
             )
             .contentShape(Capsule(style: .continuous))
             .animation(.easeOut(duration: 0.15), value: isHovering)
@@ -437,15 +697,18 @@ struct WorkspaceTabView: View {
 
 struct SidebarFolderRow: View {
     let folder: FolderItem
+    let isSelected: Bool
     let onRemove: () -> Void
     @State private var isHovering = false
 
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: "folder.fill")
-                .foregroundColor(.blue)
+                .foregroundColor(isSelected ? .white : Theme.folderBlue)
                 .font(.system(size: 13))
             Text(folder.displayName)
+                .foregroundColor(isSelected ? .white : Theme.textPrimary)
+                .fontWeight(isSelected ? .semibold : .regular)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .font(.system(size: 13))
@@ -456,7 +719,7 @@ struct SidebarFolderRow: View {
             if isHovering {
                 Button(action: onRemove) {
                     Image(systemName: "minus.circle.fill")
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Theme.textSecondary)
                         .font(.system(size: 11))
                 }
                 .buttonStyle(.plain)
@@ -464,6 +727,16 @@ struct SidebarFolderRow: View {
                 .transition(.opacity)
             }
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 9)
+        // Own selection fill: the native sidebar highlight turns grey whenever the
+        // panel is not key, which is nearly always for this non-activating panel.
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(isSelected ? Color.accentColor
+                                 : (isHovering ? Color.primary.opacity(0.08) : Color.clear))
+        )
+        .padding(.horizontal, -12)
         .animation(.easeOut(duration: 0.12), value: isHovering)
         .onHover { isHovering = $0 }
     }
@@ -477,7 +750,7 @@ struct SidebarView: View {
         VStack(spacing: 8) {
             Text("挂载目录")
                 .font(.system(size: 11, weight: .bold))
-                .foregroundColor(.secondary)
+                .foregroundColor(Theme.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 12)
                 .padding(.top, 10)
@@ -489,8 +762,8 @@ struct SidebarView: View {
             List(selection: $store.selectedFolderID) {
                 if let folders = store.selectedWorkspace?.folders, !folders.isEmpty {
                     ForEach(folders) { folder in
-                        SidebarFolderRow(folder: folder) { store.removeFolder(folder) }
-                        .listRowInsets(EdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6))
+                        SidebarFolderRow(folder: folder, isSelected: store.selectedFolderID == folder.id) { store.removeFolder(folder) }
+                        .listRowInsets(EdgeInsets(top: 0, leading: 6, bottom: 0, trailing: 6))
                         // Native sidebar selection now draws the highlight; keep the
                         // row background clear so we don't double-paint the selection.
                         .listRowBackground(Color.clear)
@@ -500,13 +773,13 @@ struct SidebarView: View {
                 } else {
                     Text("暂无挂载文件夹")
                         .font(.system(size: 12))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Theme.textSecondary)
                         .padding(.horizontal, 6)
                         .listRowBackground(Color.clear)
                 }
             }
             .listStyle(.sidebar)
-            .background(Color.clear)
+            .hideListBackground()
             
             Spacer()
 
@@ -517,6 +790,7 @@ struct SidebarView: View {
                     Text("添加本地文件夹")
                 }
                 .font(.system(size: 12, weight: .medium))
+                .foregroundColor(Theme.textPrimary)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 8)
             }
@@ -669,7 +943,7 @@ struct DetailView: View {
                         }) {
                             Image(systemName: "chevron.left")
                                 .font(.system(size: 11, weight: .bold))
-                                .foregroundColor(!atRoot ? .primary : .secondary)
+                                .foregroundColor(!atRoot ? Theme.textPrimary : Theme.textTertiary)
                         }
                         .buttonStyle(.plain)
                         .iconHover()
@@ -683,7 +957,7 @@ struct DetailView: View {
                             NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: current.path)
                         }) {
                             Image(systemName: "arrow.right.macwindow")
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Theme.textSecondary)
                                 .font(.system(size: 11))
                         }
                         .buttonStyle(.plain)
@@ -737,20 +1011,28 @@ struct DetailView: View {
                     Spacer()
                     Image(systemName: "folder.badge.plus")
                         .font(.system(size: 40))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Theme.textSecondary)
                         .padding(.bottom, 8)
                     Text("请在左侧选择或添加一个“挂载目录”")
                         .font(.system(size: 13))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Theme.textSecondary)
                     Spacer()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .background(Theme.content)
         .onChange(of: store.selectedFolderID) { _ in
             currentURL = store.selectedFolder?.url
             refreshFiles()
         }
+        .onChange(of: selectedFileIDs) { _ in
+            // Keep an open Quick Look preview in step with the selection.
+            guard PreviewController.shared.isVisible else { return }
+            let urls = selectedURLsInOrder
+            if urls.isEmpty { PreviewController.shared.close() } else { PreviewController.shared.update(urls) }
+        }
+        .background(PreviewKeyCatcher(onKey: handlePreviewKey))
         .onAppear {
             columns = decodeColumnOrder(columnOrderRaw)
             if currentURL == nil {
@@ -780,7 +1062,7 @@ struct DetailView: View {
             }
         }
         .font(.system(size: 11, weight: .semibold))
-        .foregroundColor(.secondary)
+        .foregroundColor(Theme.textSecondary)
     }
 
     @ViewBuilder
@@ -815,9 +1097,8 @@ struct DetailView: View {
         .padding(.vertical, 6)
         .frame(width: 48 + nameW + otherColumnsWidth, alignment: .leading)
         // Opaque base so the pinned header never shows the rows scrolling underneath it.
-        .background(Color.primary.opacity(0.03))
-        .background(Color(NSColor.windowBackgroundColor))
-        .overlay(Divider(), alignment: .bottom)
+        .background(Theme.content)
+        .overlay(HairlineH(), alignment: .bottom)
         .contextMenu {
             Menu("排序方式") {
                 Button { setSort(.name) } label: { sortMenuLabel("名称", .name) }
@@ -871,7 +1152,7 @@ struct DetailView: View {
                         if filteredFiles.isEmpty {
                             Text(searchText.isEmpty ? "当前文件夹为空，或无法访问" : "没有找到匹配的文件")
                                 .font(.system(size: 12))
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Theme.textSecondary)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 40)
                         } else {
@@ -912,11 +1193,11 @@ struct DetailView: View {
             Spacer()
             Image(systemName: "folder.badge.minus")
                 .font(.system(size: 36))
-                .foregroundColor(.secondary)
+                .foregroundColor(Theme.textSecondary)
                 .padding(.bottom, 8)
             Text(searchText.isEmpty ? "当前文件夹为空，或无法访问" : "没有找到匹配的文件")
                 .font(.system(size: 12))
-                .foregroundColor(.secondary)
+                .foregroundColor(Theme.textSecondary)
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -982,6 +1263,44 @@ struct DetailView: View {
             refreshFiles()
         } else {
             NSWorkspace.shared.open(file.url)
+        }
+    }
+
+    // MARK: Quick Look (space / Esc / arrows)
+
+    private var selectedURLsInOrder: [URL] {
+        filteredFiles.filter { selectedFileIDs.contains($0.id) }.map { $0.url }
+    }
+
+    /// Returns true when the key was consumed.
+    private func handlePreviewKey(_ event: NSEvent) -> Bool {
+        if event.window?.firstResponder is NSText { return false }   // typing in the search field
+        guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return false }
+        let preview = PreviewController.shared
+        switch event.keyCode {
+        case 49:   // space: toggle
+            if event.isARepeat { return true }
+            if preview.isVisible { preview.close(); return true }
+            let urls = selectedURLsInOrder
+            guard !urls.isEmpty else { return false }
+            preview.show(urls, host: event.window ?? NSApp.windows.first(where: { $0.identifier?.rawValue == "FolderShelfWindow" }))
+            return true
+        case 53:   // esc: close
+            guard preview.isVisible else { return false }
+            preview.close()
+            return true
+        case 123, 124, 125, 126:   // arrows move the selection while previewing
+            guard preview.isVisible else { return false }
+            let visible = filteredFiles
+            let picked = visible.indices.filter { selectedFileIDs.contains(visible[$0].id) }
+            let forward = event.keyCode == 124 || event.keyCode == 125
+            let next = PreviewNav.step(from: forward ? picked.max() : picked.min(), count: visible.count, forward: forward)
+            guard visible.indices.contains(next) else { return true }
+            selectedFileIDs = [visible[next].id]
+            selectionAnchorID = visible[next].id
+            return true
+        default:
+            return false
         }
     }
 
@@ -1221,7 +1540,7 @@ struct FileRowView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .font(.system(size: 13))
-                    .foregroundColor(.primary)
+                    .foregroundColor(Theme.textPrimary)
                     .help(file.name)
                 Spacer(minLength: 0)
             }
@@ -1232,7 +1551,7 @@ struct FileRowView: View {
             ForEach(columns) { col in
                 columnCell(col)
                     .font(.system(size: 11))
-                    .foregroundColor(.secondary)
+                    .foregroundColor(Theme.textSecondary)
                     .lineLimit(1)
                     .frame(width: columnWidth(col), alignment: .leading)
                 Spacer().frame(width: 15)
@@ -1242,7 +1561,7 @@ struct FileRowView: View {
         .padding(.vertical, 6)
         .background(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(isSelected ? Color.accentColor.opacity(0.25)
+                .fill(isSelected ? Color.accentColor.opacity(0.32)
                                  : (isHovering ? Color.primary.opacity(0.07) : Color.clear))
         )
         .animation(.easeOut(duration: 0.12), value: isHovering)
@@ -1318,14 +1637,14 @@ struct FileCardView: View {
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
                 .font(.system(size: 11))
-                .foregroundColor(.primary)
+                .foregroundColor(Theme.textPrimary)
                 .frame(height: 32, alignment: .top)
         }
         .frame(width: 75, height: 90)
         .padding(6)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(isSelected ? Color.accentColor.opacity(0.22)
+                .fill(isSelected ? Color.accentColor.opacity(0.28)
                                  : (isHovering ? Color.primary.opacity(0.07) : Color.clear))
         )
         // A hairline accent ring makes the selected card readable even when
@@ -1410,6 +1729,9 @@ final class RowInteractionNSView: NSView, NSDraggingSource {
     // even when the panel isn't key — otherwise the first click would be eaten.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
+    // Clicking a row makes the (becomesKeyOnlyIfNeeded) panel key without activating
+    // the app, so the space bar reaches the Quick Look handler.
+    override var needsPanelToBecomeKey: Bool { true }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -1513,6 +1835,7 @@ class WindowDelegate: NSObject, NSWindowDelegate {
     var onFocusLost: (() -> Void)?
     
     func windowDidResignKey(_ notification: Notification) {
+        PreviewController.shared.closeIfFocusLost()
         onFocusLost?()
     }
 }
@@ -1553,7 +1876,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func createWindow() {
-        let window = NSPanel(
+        let window = FolderPanel(
             contentRect: NSRect(x: 0, y: 0, width: 660, height: 440),
             styleMask: [.borderless, .resizable, .nonactivatingPanel],
             backing: .buffered,
@@ -1575,7 +1898,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         
         // Adaptive background that follows the system light/dark appearance
-        window.backgroundColor = .windowBackgroundColor
+        window.backgroundColor = Theme.chromeNS
         window.isOpaque = true
         window.hasShadow = true
         
@@ -1666,6 +1989,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Show the panel above the active app WITHOUT activating FolderShelf, so
         // the menu bar / Ice stay interactive and a fullscreen app is not kicked out.
         window.orderFrontRegardless()
+        NotificationCenter.default.post(name: .folderTopPanelDidShow, object: nil)
     }
     
     @objc func toggleWindow() {

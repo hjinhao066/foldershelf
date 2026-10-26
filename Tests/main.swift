@@ -1,0 +1,39 @@
+// Unit tests for the pure logic in App.swift. Run: Tests/run_tests.sh
+import Foundation
+
+var failures = 0
+func check(_ cond: Bool, _ msg: String) {
+    if cond { print("PASS \(msg)") } else { print("FAIL \(msg)"); failures += 1 }
+}
+
+// App.swift's @main entry is renamed at build time (see run_tests.sh); this is the process entry.
+@_cdecl("main")
+func testMain(_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Int32 {
+    // StorageInfo
+    let gb: Int64 = 1_000_000_000
+    let s = StorageInfo(name: "Macintosh HD", available: 182 * gb, total: 1000 * gb)
+    check(s.summary == "Macintosh HD 剩 182 GB / 共 1 TB", "summary text: \(s.summary)")
+    check(abs(s.usedFraction - 0.818) < 1e-9, "usedFraction 0.818")
+    check(StorageInfo(name: "x", available: 0, total: 0).usedFraction == 0, "zero total -> 0")
+    check(StorageInfo(name: "x", available: 5, total: 4).usedFraction == 0, "available>total clamps to 0")
+    check(StorageInfo(name: "x", available: -5, total: 4).usedFraction == 1, "negative available clamps to 1")
+    if let live = StorageInfo.load() {
+        check(live.total > 0 && live.available >= 0 && live.available <= live.total, "live startup disk: \(live.summary)")
+    } else {
+        check(false, "StorageInfo.load() returned nil for /")
+    }
+    check(StorageInfo.load(at: URL(fileURLWithPath: "/definitely/not/here")) == nil, "missing path -> nil")
+
+    // PreviewNav
+    check(PreviewNav.step(from: 2, count: 5, forward: true) == 3, "step forward")
+    check(PreviewNav.step(from: 2, count: 5, forward: false) == 1, "step back")
+    check(PreviewNav.step(from: 4, count: 5, forward: true) == 4, "clamp at end")
+    check(PreviewNav.step(from: 0, count: 5, forward: false) == 0, "clamp at start")
+    check(PreviewNav.step(from: nil, count: 5, forward: true) == 0, "nil forward -> first")
+    check(PreviewNav.step(from: nil, count: 5, forward: false) == 4, "nil back -> last")
+    check(PreviewNav.step(from: nil, count: 0, forward: true) == 0, "empty list")
+
+    print(failures == 0 ? "ALL PASSED" : "\(failures) FAILED")
+    return failures == 0 ? 0 : 1
+
+}
