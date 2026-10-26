@@ -33,6 +33,57 @@ enum SortField: String, Codable {
     case type
 }
 
+// The optional columns shown to the right of the (always-first) name column.
+// Order is user-customizable by dragging the headers; visibility via the menu.
+enum FileColumn: String, Codable, CaseIterable, Identifiable {
+    case type
+    case dateModified
+    case dateCreated
+    case size
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .type: return "种类"
+        case .dateModified: return "修改日期"
+        case .dateCreated: return "创建日期"
+        case .size: return "大小"
+        }
+    }
+
+    var sortField: SortField {
+        switch self {
+        case .type: return .type
+        case .dateModified: return .dateModified
+        case .dateCreated: return .dateCreated
+        case .size: return .size
+        }
+    }
+
+    var minWidth: CGFloat {
+        switch self {
+        case .type: return 50
+        case .dateModified: return 60
+        case .dateCreated: return 60
+        case .size: return 40
+        }
+    }
+}
+
+// Parse the persisted "type,dateModified,…" string into a complete, de-duplicated
+// column list (any columns missing from storage are appended in their default order).
+func decodeColumnOrder(_ raw: String) -> [FileColumn] {
+    var result: [FileColumn] = []
+    for token in raw.split(separator: ",") {
+        if let c = FileColumn(rawValue: token.trimmingCharacters(in: .whitespaces)), !result.contains(c) {
+            result.append(c)
+        }
+    }
+    for c in FileColumn.allCases where !result.contains(c) { result.append(c) }
+    return result
+}
+
 struct LocalFile: Identifiable, Hashable {
     var id: URL { url }
     let url: URL
@@ -504,19 +555,33 @@ struct DetailView: View {
     @State private var files: [LocalFile] = []
     @State private var currentURL: URL? = nil
     @State private var searchText = ""
-    @State private var selectedFileID: URL? = nil
+    // Multi-selection: cmd-click toggles a row, shift-click selects a range from
+    // the anchor, a plain click selects just one. Anchor is the last plain/cmd click.
+    @State private var selectedFileIDs: Set<URL> = []
+    @State private var selectionAnchorID: URL? = nil
     @State private var nameWidth: CGFloat = 200   // resizable; auto-expands to fill when the window is wide
     // Persisted so the list/grid choice survives app restarts.
     @AppStorage("FolderShelfViewMode") private var viewMode: ViewMode = .list
-    @State private var sortField: SortField = .dateModified
-    @State private var sortAscending = false
-    
-    // Customizable Columns
-    @State private var showType = true
-    @State private var showDateModified = true
-    @State private var showDateCreated = false   // Finder's default list view hides "Created"; re-enable via the column menu
-    @State private var showSize = true
-    
+    // Sort settings persist across launches (like Finder).
+    // Default: newest-modified first, with no folder grouping, so a fresh install
+    // opens straight into a pure "most recently modified on top" order.
+    @AppStorage("FolderShelfSortField") private var sortField: SortField = .dateModified
+    @AppStorage("FolderShelfSortAscending") private var sortAscending = false
+    // When on, folders are grouped above files ("文件夹始终置顶", Finder's default).
+    // Off by default → a pure single-key sort (everything strictly by modified date).
+    @AppStorage("FolderShelfFoldersOnTop") private var foldersOnTop = false
+
+    // Column visibility (persisted)
+    @AppStorage("FolderShelfShowType") private var showType = true
+    @AppStorage("FolderShelfShowModified") private var showDateModified = true
+    @AppStorage("FolderShelfShowCreated") private var showDateCreated = true
+    @AppStorage("FolderShelfShowSize") private var showSize = true
+
+    // Column order (persisted as comma-separated rawValues); drag a header to reorder.
+    @AppStorage("FolderShelfColumnOrder") private var columnOrderRaw: String = "type,dateModified,dateCreated,size"
+    @State private var columns: [FileColumn] = FileColumn.allCases
+    @State private var draggingColumn: FileColumn? = nil
+
     // Resizable Columns Widths
     @State private var typeWidth: CGFloat = 100
     @State private var modifiedWidth: CGFloat = 120
@@ -525,10 +590,41 @@ struct DetailView: View {
     
     let timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
     
+    // Column helpers (visibility / width / order) ------------------------------
+    private func isVisible(_ c: FileColumn) -> Bool {
+        switch c {
+        case .type: return showType
+        case .dateModified: return showDateModified
+        case .dateCreated: return showDateCreated
+        case .size: return showSize
+        }
+    }
+    private func columnWidth(_ c: FileColumn) -> CGFloat {
+        switch c {
+        case .type: return typeWidth
+        case .dateModified: return modifiedWidth
+        case .dateCreated: return createdWidth
+        case .size: return sizeWidth
+        }
+    }
+    private func columnWidthBinding(_ c: FileColumn) -> Binding<CGFloat> {
+        switch c {
+        case .type: return $typeWidth
+        case .dateModified: return $modifiedWidth
+        case .dateCreated: return $createdWidth
+        case .size: return $sizeWidth
+        }
+    }
+    private var visibleColumns: [FileColumn] { columns.filter { isVisible($0) } }
+    private func persistColumnOrder() {
+        columnOrderRaw = columns.map { $0.rawValue }.joined(separator: ",")
+    }
+
     var sortedFiles: [LocalFile] {
         files.sorted { (f1, f2) -> Bool in
-            // Keep folders above files, like Finder's default sort.
-            if f1.isDirectory != f2.isDirectory {
+            // Keep folders above files only when "文件夹始终置顶" is on (Finder-like).
+            // Off → a single pure sort key (e.g. strict created-date order).
+            if foldersOnTop && f1.isDirectory != f2.isDirectory {
                 return f1.isDirectory
             }
             switch sortField {
@@ -656,6 +752,7 @@ struct DetailView: View {
             refreshFiles()
         }
         .onAppear {
+            columns = decodeColumnOrder(columnOrderRaw)
             if currentURL == nil {
                 currentURL = store.selectedFolder?.url
             }
@@ -670,10 +767,7 @@ struct DetailView: View {
     // 15pt gap/divider that follows each one (and the gap after the name column).
     private var otherColumnsWidth: CGFloat {
         var w: CGFloat = 15
-        if showType { w += typeWidth + 15 }
-        if showDateModified { w += modifiedWidth + 15 }
-        if showDateCreated { w += createdWidth + 15 }
-        if showSize { w += sizeWidth + 15 }
+        for c in visibleColumns { w += columnWidth(c) + 15 }
         return w
     }
 
@@ -698,29 +792,23 @@ struct DetailView: View {
             // Dragging this resizes the name column (and triggers horizontal scroll for long names).
             ResizableHeaderDivider(width: Binding(get: { nameW }, set: { nameWidth = $0 }), minWidth: 120)
 
-            if showType {
-                Button(action: { toggleSort(.type) }) { headerLabel("种类", .type) }
+            // Optional columns: rendered in the user's order; drag a header onto
+            // another to reorder (the name column always stays first, like Finder).
+            ForEach(visibleColumns) { col in
+                Button(action: { toggleSort(col.sortField) }) { headerLabel(col.title, col.sortField) }
                     .buttonStyle(.plain)
-                    .frame(width: typeWidth, alignment: .leading)
-                ResizableHeaderDivider(width: $typeWidth, minWidth: 50)
-            }
-            if showDateModified {
-                Button(action: { toggleSort(.dateModified) }) { headerLabel("修改日期", .dateModified) }
-                    .buttonStyle(.plain)
-                    .frame(width: modifiedWidth, alignment: .leading)
-                ResizableHeaderDivider(width: $modifiedWidth, minWidth: 60)
-            }
-            if showDateCreated {
-                Button(action: { toggleSort(.dateCreated) }) { headerLabel("创建日期", .dateCreated) }
-                    .buttonStyle(.plain)
-                    .frame(width: createdWidth, alignment: .leading)
-                ResizableHeaderDivider(width: $createdWidth, minWidth: 60)
-            }
-            if showSize {
-                Button(action: { toggleSort(.size) }) { headerLabel("大小", .size) }
-                    .buttonStyle(.plain)
-                    .frame(width: sizeWidth, alignment: .leading)
-                ResizableHeaderDivider(width: $sizeWidth, minWidth: 40)
+                    .frame(width: columnWidth(col), alignment: .leading)
+                    .opacity(draggingColumn == col ? 0.35 : 1)
+                    .onDrag {
+                        draggingColumn = col
+                        return NSItemProvider(object: col.rawValue as NSString)
+                    }
+                    .onDrop(of: [UTType.text.identifier],
+                            delegate: ColumnDropDelegate(target: col,
+                                                         columns: $columns,
+                                                         dragging: $draggingColumn,
+                                                         persist: persistColumnOrder))
+                ResizableHeaderDivider(width: columnWidthBinding(col), minWidth: col.minWidth)
             }
         }
         .padding(.horizontal, 24)
@@ -731,10 +819,41 @@ struct DetailView: View {
         .background(Color(NSColor.windowBackgroundColor))
         .overlay(Divider(), alignment: .bottom)
         .contextMenu {
-            Toggle("种类", isOn: $showType)
-            Toggle("修改日期", isOn: $showDateModified)
-            Toggle("创建日期", isOn: $showDateCreated)
-            Toggle("大小", isOn: $showSize)
+            Menu("排序方式") {
+                Button { setSort(.name) } label: { sortMenuLabel("名称", .name) }
+                Button { setSort(.type) } label: { sortMenuLabel("种类", .type) }
+                Button { setSort(.dateModified) } label: { sortMenuLabel("修改日期", .dateModified) }
+                Button { setSort(.dateCreated) } label: { sortMenuLabel("创建日期", .dateCreated) }
+                Button { setSort(.size) } label: { sortMenuLabel("大小", .size) }
+                Divider()
+                Button { sortAscending = true } label: {
+                    Label("升序", systemImage: sortAscending ? "checkmark" : "arrow.up")
+                }
+                Button { sortAscending = false } label: {
+                    Label("降序", systemImage: !sortAscending ? "checkmark" : "arrow.down")
+                }
+            }
+            Toggle("文件夹始终置顶", isOn: $foldersOnTop)
+            Divider()
+            Section("显示列") {
+                Toggle("种类", isOn: $showType)
+                Toggle("修改日期", isOn: $showDateModified)
+                Toggle("创建日期", isOn: $showDateCreated)
+                Toggle("大小", isOn: $showSize)
+            }
+        }
+    }
+
+    private func setSort(_ field: SortField) {
+        if sortField == field { sortAscending.toggle() } else { sortField = field }
+    }
+
+    @ViewBuilder
+    private func sortMenuLabel(_ title: String, _ field: SortField) -> some View {
+        if sortField == field {
+            Label(title, systemImage: "checkmark")
+        } else {
+            Text(title)
         }
     }
 
@@ -759,20 +878,18 @@ struct DetailView: View {
                             ForEach(filteredFiles) { file in
                                 FileRowView(
                                     file: file,
-                                    isSelected: selectedFileID == file.id,
-                                    showType: showType,
-                                    showDateModified: showDateModified,
-                                    showDateCreated: showDateCreated,
-                                    showSize: showSize,
+                                    isSelected: selectedFileIDs.contains(file.id),
+                                    columns: visibleColumns,
                                     nameWidth: nameW,
                                     typeWidth: typeWidth,
                                     modifiedWidth: modifiedWidth,
                                     createdWidth: createdWidth,
                                     sizeWidth: sizeWidth,
-                                    onSingleTap: { selectedFileID = file.id },
-                                    onDoubleTap: { handleFileDoubleTap(file: file) }
+                                    onClick: { shift, cmd in selectFile(file, shift: shift, command: cmd) },
+                                    onDoubleClick: { handleFileDoubleTap(file: file) },
+                                    dragURLs: { dragURLs(for: file) },
+                                    menuItems: { menuItems(for: file) }
                                 )
-                                .contextMenu { fileContextMenu(file) }
                             }
                         }
                     } header: {
@@ -815,11 +932,12 @@ struct DetailView: View {
                 ForEach(filteredFiles) { file in
                     FileCardView(
                         file: file,
-                        isSelected: selectedFileID == file.id,
-                        onSingleTap: { selectedFileID = file.id },
-                        onDoubleTap: { handleFileDoubleTap(file: file) }
+                        isSelected: selectedFileIDs.contains(file.id),
+                        onClick: { shift, cmd in selectFile(file, shift: shift, command: cmd) },
+                        onDoubleClick: { handleFileDoubleTap(file: file) },
+                        dragURLs: { dragURLs(for: file) },
+                        menuItems: { menuItems(for: file) }
                     )
-                    .contextMenu { fileContextMenu(file) }
                 }
             }
             .padding(16)
@@ -859,24 +977,75 @@ struct DetailView: View {
         if file.isDirectory {
             currentURL = file.url
             searchText = ""          // start fresh in the new folder, like Finder
-            selectedFileID = nil
+            selectedFileIDs = []
+            selectionAnchorID = nil
             refreshFiles()
         } else {
             NSWorkspace.shared.open(file.url)
         }
     }
 
+    // MARK: Selection (single / cmd-toggle / shift-range)
+
+    private func selectFile(_ file: LocalFile, shift: Bool, command: Bool) {
+        let visible = filteredFiles
+        if shift, let anchorID = selectionAnchorID,
+           let a = visible.firstIndex(where: { $0.id == anchorID }),
+           let b = visible.firstIndex(where: { $0.id == file.id }) {
+            // Range from the anchor to the clicked row; anchor stays put so a
+            // follow-up shift-click can grow or shrink the same range.
+            let range = min(a, b)...max(a, b)
+            selectedFileIDs = Set(visible[range].map { $0.id })
+        } else if command {
+            if selectedFileIDs.contains(file.id) {
+                selectedFileIDs.remove(file.id)
+            } else {
+                selectedFileIDs.insert(file.id)
+            }
+            selectionAnchorID = file.id
+        } else {
+            selectedFileIDs = [file.id]
+            selectionAnchorID = file.id
+        }
+    }
+
+    // What a drag starting on `file` should carry: the whole selection when the
+    // row is part of a multi-selection, otherwise just that one file (in the
+    // current display order so the drop lands them in a sensible sequence).
+    private func dragURLs(for file: LocalFile) -> [URL] {
+        if selectedFileIDs.contains(file.id) && selectedFileIDs.count > 1 {
+            return filteredFiles.filter { selectedFileIDs.contains($0.id) }.map { $0.url }
+        }
+        return [file.url]
+    }
+
     // MARK: Finder-style right-click actions
 
-    @ViewBuilder
-    func fileContextMenu(_ file: LocalFile) -> some View {
-        Button("打开") { handleFileDoubleTap(file: file) }
-        Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([file.url]) }
-        Divider()
-        Button("重命名…") { renameFile(file) }
-        Button("拷贝") { copyToPasteboard(file) }
-        Divider()
-        Button("移到废纸篓", role: .destructive) { trashFile(file) }
+    // Right-clicking a row that's part of a multi-selection acts on the whole
+    // selection (like Finder); otherwise it acts on just that one file. Built as
+    // plain data so the AppKit interaction layer can show it as an NSMenu.
+    private func menuItems(for file: LocalFile) -> [RowMenuItem] {
+        if selectedFileIDs.contains(file.id) && selectedFileIDs.count > 1 {
+            let targets = filteredFiles.filter { selectedFileIDs.contains($0.id) }
+            return [
+                RowMenuItem(title: "在访达中显示（\(targets.count) 项）") {
+                    NSWorkspace.shared.activateFileViewerSelecting(targets.map { $0.url })
+                },
+                RowMenuItem(title: "拷贝（\(targets.count) 项）") { copyToPasteboard(targets) },
+                .separator,
+                RowMenuItem(title: "移到废纸篓（\(targets.count) 项）") { trashFiles(targets) },
+            ]
+        } else {
+            return [
+                RowMenuItem(title: "打开") { handleFileDoubleTap(file: file) },
+                RowMenuItem(title: "在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([file.url]) },
+                .separator,
+                RowMenuItem(title: "重命名…") { renameFile(file) },
+                RowMenuItem(title: "拷贝") { copyToPasteboard([file]) },
+                .separator,
+                RowMenuItem(title: "移到废纸篓") { trashFiles([file]) },
+            ]
+        }
     }
 
     func renameFile(_ file: LocalFile) {
@@ -902,21 +1071,24 @@ struct DetailView: View {
         }
     }
 
-    func copyToPasteboard(_ file: LocalFile) {
+    func copyToPasteboard(_ files: [LocalFile]) {
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.writeObjects([file.url as NSURL])
+        pb.writeObjects(files.map { $0.url as NSURL })
     }
 
-    func trashFile(_ file: LocalFile) {
-        do {
-            try FileManager.default.trashItem(at: file.url, resultingItemURL: nil)
-            if selectedFileID == file.id { selectedFileID = nil }
-            refreshFiles()
-        } catch {
-            NSSound.beep()
-            print("Trash failed: \(error)")
+    func trashFiles(_ files: [LocalFile]) {
+        for file in files {
+            do {
+                try FileManager.default.trashItem(at: file.url, resultingItemURL: nil)
+                selectedFileIDs.remove(file.id)
+                if selectionAnchorID == file.id { selectionAnchorID = nil }
+            } catch {
+                NSSound.beep()
+                print("Trash failed: \(error)")
+            }
         }
+        refreshFiles()
     }
     
     func handleDrop(providers: [NSItemProvider], destFolder: FolderItem) -> Bool {
@@ -989,15 +1161,42 @@ struct ResizableHeaderDivider: View {
     }
 }
 
+// MARK: - Column Reorder Drop Delegate
+
+// Live-reorders the column array as a dragged header passes over another header,
+// then persists the new order when the drag is released.
+struct ColumnDropDelegate: DropDelegate {
+    let target: FileColumn
+    @Binding var columns: [FileColumn]
+    @Binding var dragging: FileColumn?
+    let persist: () -> Void
+
+    func dropEntered(info: DropInfo) {
+        guard let dragging = dragging, dragging != target,
+              let from = columns.firstIndex(of: dragging),
+              let to = columns.firstIndex(of: target) else { return }
+        withAnimation(.easeInOut(duration: 0.15)) {
+            columns.move(fromOffsets: IndexSet(integer: from),
+                         toOffset: to > from ? to + 1 : to)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+
+    func performDrop(info: DropInfo) -> Bool {
+        dragging = nil
+        persist()
+        return true
+    }
+}
+
 // MARK: - File Row View (List mode)
 
 struct FileRowView: View {
     let file: LocalFile
     let isSelected: Bool
-    let showType: Bool
-    let showDateModified: Bool
-    let showDateCreated: Bool
-    let showSize: Bool
+    // Visible columns in display order (matches the header).
+    let columns: [FileColumn]
 
     let nameWidth: CGFloat
     let typeWidth: CGFloat
@@ -1005,11 +1204,13 @@ struct FileRowView: View {
     let createdWidth: CGFloat
     let sizeWidth: CGFloat
 
-    let onSingleTap: () -> Void
-    let onDoubleTap: () -> Void
+    let onClick: (Bool, Bool) -> Void   // (shiftDown, commandDown)
+    let onDoubleClick: () -> Void
+    let dragURLs: () -> [URL]
+    let menuItems: () -> [RowMenuItem]
 
     @State private var isHovering = false
-    
+
     var body: some View {
         HStack(spacing: 0) {
             // Name Column (fixed width; widen it via the header divider and scroll
@@ -1027,40 +1228,13 @@ struct FileRowView: View {
             .frame(width: nameWidth, alignment: .leading)
             Spacer().frame(width: 15)
 
-            // Type Column
-            if showType {
-                Text(file.typeDescription)
+            // Optional columns, rendered in the same order as the header.
+            ForEach(columns) { col in
+                columnCell(col)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
-                    .frame(width: typeWidth, alignment: .leading)
-                Spacer().frame(width: 15)
-            }
-
-            // Date Modified Column
-            if showDateModified {
-                Text(fileDateString(file.dateModified))
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .frame(width: modifiedWidth, alignment: .leading)
-                Spacer().frame(width: 15)
-            }
-
-            // Date Created Column
-            if showDateCreated {
-                Text(fileDateString(file.dateCreated))
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .frame(width: createdWidth, alignment: .leading)
-                Spacer().frame(width: 15)
-            }
-
-            // Size Column
-            if showSize {
-                Text(fileSizeString(file.size))
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                    .frame(width: sizeWidth, alignment: .leading)
+                    .frame(width: columnWidth(col), alignment: .leading)
                 Spacer().frame(width: 15)
             }
         }
@@ -1072,19 +1246,37 @@ struct FileRowView: View {
                                  : (isHovering ? Color.primary.opacity(0.07) : Color.clear))
         )
         .animation(.easeOut(duration: 0.12), value: isHovering)
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            isHovering = hovering
+        // AppKit-backed interaction surface: click selection (with modifiers),
+        // double-click to open, hover highlight, right-click menu, and a real
+        // multi-item drag session so a whole selection drags out together.
+        .overlay(
+            RowInteractionView(
+                toolTip: file.name,
+                dragURLs: dragURLs,
+                onClick: onClick,
+                onDoubleClick: onDoubleClick,
+                onHover: { isHovering = $0 },
+                menuItems: menuItems
+            )
+        )
+    }
+
+    @ViewBuilder
+    private func columnCell(_ col: FileColumn) -> some View {
+        switch col {
+        case .type:         Text(file.typeDescription)
+        case .dateModified: Text(fileDateString(file.dateModified))
+        case .dateCreated:  Text(fileDateString(file.dateCreated))
+        case .size:         Text(fileSizeString(file.size))
         }
-        .onTapGesture(count: 2) {
-            onDoubleTap()
-        }
-        .onTapGesture(count: 1) {
-            onSingleTap()
-        }
-        .onDrag {
-            onSingleTap()
-            return NSItemProvider(object: file.url as NSURL)
+    }
+
+    private func columnWidth(_ col: FileColumn) -> CGFloat {
+        switch col {
+        case .type:         return typeWidth
+        case .dateModified: return modifiedWidth
+        case .dateCreated:  return createdWidth
+        case .size:         return sizeWidth
         }
     }
 
@@ -1109,10 +1301,12 @@ struct FileRowView: View {
 struct FileCardView: View {
     let file: LocalFile
     let isSelected: Bool
-    let onSingleTap: () -> Void
-    let onDoubleTap: () -> Void
+    let onClick: (Bool, Bool) -> Void
+    let onDoubleClick: () -> Void
+    let dragURLs: () -> [URL]
+    let menuItems: () -> [RowMenuItem]
     @State private var isHovering = false
-    
+
     var body: some View {
         VStack(spacing: 6) {
             Image(nsImage: NSWorkspace.shared.icon(forFile: file.url.path))
@@ -1141,21 +1335,166 @@ struct FileCardView: View {
                 .stroke(isSelected ? Color.accentColor.opacity(0.55) : Color.clear, lineWidth: 1)
         )
         .animation(.easeOut(duration: 0.12), value: isHovering)
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            isHovering = hovering
+        .overlay(
+            RowInteractionView(
+                toolTip: file.name,
+                dragURLs: dragURLs,
+                onClick: onClick,
+                onDoubleClick: onDoubleClick,
+                onHover: { isHovering = $0 },
+                menuItems: menuItems
+            )
+        )
+    }
+}
+
+// MARK: - Row Interaction (AppKit drag/click/menu surface)
+
+// A context-menu entry expressed as plain data; `title == nil` means a separator.
+struct RowMenuItem {
+    let title: String?
+    let action: (() -> Void)?
+    init(title: String?, action: (() -> Void)?) {
+        self.title = title
+        self.action = action
+    }
+    init(title: String, _ action: @escaping () -> Void) {
+        self.title = title
+        self.action = action
+    }
+    static let separator = RowMenuItem(title: nil, action: nil)
+}
+
+// Transparent overlay that owns mouse interaction for a file row/card. SwiftUI's
+// `.onDrag` can only ever vend a single item, so to drag a whole multi-selection
+// out together we drop to AppKit and start a real NSDraggingSession with one
+// dragging item per selected URL. This view also forwards click/double-click
+// (with modifier flags), hover, and the right-click menu back to SwiftUI.
+struct RowInteractionView: NSViewRepresentable {
+    let toolTip: String?
+    let dragURLs: () -> [URL]
+    let onClick: (Bool, Bool) -> Void   // (shiftDown, commandDown)
+    let onDoubleClick: () -> Void
+    let onHover: (Bool) -> Void
+    let menuItems: () -> [RowMenuItem]
+
+    func makeNSView(context: Context) -> RowInteractionNSView {
+        let v = RowInteractionNSView()
+        apply(to: v)
+        return v
+    }
+    func updateNSView(_ nsView: RowInteractionNSView, context: Context) {
+        apply(to: nsView)
+    }
+    private func apply(to v: RowInteractionNSView) {
+        v.toolTip = toolTip
+        v.dragURLs = dragURLs
+        v.onClick = onClick
+        v.onDoubleClick = onDoubleClick
+        v.onHover = onHover
+        v.menuItemsProvider = menuItems
+    }
+}
+
+final class RowInteractionNSView: NSView, NSDraggingSource {
+    var dragURLs: (() -> [URL])?
+    var onClick: ((Bool, Bool) -> Void)?
+    var onDoubleClick: (() -> Void)?
+    var onHover: ((Bool) -> Void)?
+    var menuItemsProvider: (() -> [RowMenuItem])?
+
+    private var mouseDownEvent: NSEvent?
+    private var trackingArea: NSTrackingArea?
+
+    // The host is a non-activating floating panel, so accept the very first click
+    // even when the panel isn't key — otherwise the first click would be eaten.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let t = trackingArea { removeTrackingArea(t) }
+        let t = NSTrackingArea(rect: bounds,
+                               options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                               owner: self, userInfo: nil)
+        addTrackingArea(t)
+        trackingArea = t
+    }
+
+    override func mouseEntered(with event: NSEvent) { onHover?(true) }
+    override func mouseExited(with event: NSEvent) { onHover?(false) }
+
+    override func mouseDown(with event: NSEvent) {
+        mouseDownEvent = event
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let down = mouseDownEvent else { return }
+        let dx = event.locationInWindow.x - down.locationInWindow.x
+        let dy = event.locationInWindow.y - down.locationInWindow.y
+        // Small threshold so a slightly-shaky click isn't read as a drag.
+        guard (dx * dx + dy * dy) > 16 else { return }
+        guard let urls = dragURLs?(), !urls.isEmpty else { mouseDownEvent = nil; return }
+        mouseDownEvent = nil
+
+        let origin = convert(down.locationInWindow, from: nil)
+        var items: [NSDraggingItem] = []
+        for (i, url) in urls.enumerated() {
+            let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+            let icon = NSWorkspace.shared.icon(forFile: url.path)
+            icon.size = NSSize(width: 32, height: 32)
+            // Fan the icons out slightly so a multi-file drag reads as a stack.
+            let frame = NSRect(x: origin.x - 16 + CGFloat(i) * 4,
+                               y: origin.y - 16 - CGFloat(i) * 4,
+                               width: 32, height: 32)
+            item.setDraggingFrame(frame, contents: icon)
+            items.append(item)
         }
-        .onTapGesture(count: 2) {
-            onDoubleTap()
-        }
-        .onTapGesture(count: 1) {
-            onSingleTap()
-        }
-        .onDrag {
-            onSingleTap()
-            return NSItemProvider(object: file.url as NSURL)
+        beginDraggingSession(with: items, event: down, source: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard mouseDownEvent != nil else { return }
+        mouseDownEvent = nil
+        if event.clickCount >= 2 {
+            onDoubleClick?()
+        } else {
+            let flags = event.modifierFlags
+            onClick?(flags.contains(.shift), flags.contains(.command))
         }
     }
+
+    func draggingSession(_ session: NSDraggingSession,
+                         sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        [.copy, .move, .generic]
+    }
+
+    // Right-click menu, built fresh from the current selection each time.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let items = menuItemsProvider?(), !items.isEmpty else { return nil }
+        let menu = NSMenu()
+        for it in items {
+            if it.title == nil {
+                menu.addItem(.separator())
+            } else {
+                let mi = NSMenuItem(title: it.title!, action: #selector(handleMenu(_:)), keyEquivalent: "")
+                mi.target = self
+                mi.representedObject = MenuActionBox(it.action)
+                menu.addItem(mi)
+            }
+        }
+        return menu
+    }
+
+    @objc private func handleMenu(_ sender: NSMenuItem) {
+        (sender.representedObject as? MenuActionBox)?.action?()
+    }
+}
+
+// Wraps a closure so it can ride along in NSMenuItem.representedObject.
+final class MenuActionBox {
+    let action: (() -> Void)?
+    init(_ action: (() -> Void)?) { self.action = action }
 }
 
 struct FileIconView: View {
