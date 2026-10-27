@@ -1,4 +1,5 @@
 // Unit tests for the pure logic in App.swift. Run: Tests/run_tests.sh
+import AppKit
 import Foundation
 
 var failures = 0
@@ -39,6 +40,14 @@ func testMain(_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<C
     check(PreviewNav.move(from: nil, count: 20, delta: -1) == 19, "no selection, up -> last")
     check(PreviewNav.gridColumns(width: 480) == 5, "gridColumns 480pt -> 5")
     check(PreviewNav.gridColumns(width: 10) == 1, "gridColumns narrow -> 1")
+    check(!PreviewNav.arrowsMoveFiles(previewVisible: false, focusInSidebarList: true), "sidebar focus, no preview -> arrows left to sidebar")
+    check(PreviewNav.arrowsMoveFiles(previewVisible: false, focusInSidebarList: false), "file area focus -> arrows move files")
+    check(PreviewNav.arrowsMoveFiles(previewVisible: true, focusInSidebarList: true), "preview open -> arrows step files")
+    let table = NSTableView(), inner = NSView()
+    table.addSubview(inner)
+    check(PreviewNav.isInsideTable(inner), "view inside NSTableView detected")
+    check(!PreviewNav.isInsideTable(NSView()), "plain view is not a table")
+    check(!PreviewNav.isInsideTable(nil), "nil responder is not a table")
 
     print(failures == 0 ? "ALL PASSED" : "\(failures) FAILED")
     return failures == 0 ? 0 : 1

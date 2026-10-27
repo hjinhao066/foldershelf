@@ -247,6 +247,22 @@ enum PreviewNav {
         move(from: index, count: count, delta: forward ? 1 : -1)
     }
 
+    /// Arrows belong to the sidebar's folder list whenever it has focus, unless a preview
+    /// is open (then they step the preview through the files, as before).
+    static func arrowsMoveFiles(previewVisible: Bool, focusInSidebarList: Bool) -> Bool {
+        previewVisible || !focusInSidebarList
+    }
+
+    /// True when `responder` is, or sits inside, an NSTableView (the sidebar List).
+    static func isInsideTable(_ responder: NSResponder?) -> Bool {
+        var v = responder as? NSView
+        while let cur = v {
+            if cur is NSTableView { return true }
+            v = cur.superview
+        }
+        return false
+    }
+
     /// Columns of the adaptive icon grid (min item width 75, spacing 12, padding 16 each side).
     static func gridColumns(width: CGFloat) -> Int {
         max(1, Int((width - 32 + 12) / (75 + 12)))
@@ -1326,6 +1342,8 @@ struct DetailView: View {
             preview.close()
             return true
         case 123, 124, 125, 126:   // arrows move the selection (Finder-style)
+            guard PreviewNav.arrowsMoveFiles(previewVisible: preview.isVisible,
+                                             focusInSidebarList: PreviewNav.isInsideTable(event.window?.firstResponder)) else { return false }
             let up = event.keyCode == 126, down = event.keyCode == 125
             let left = event.keyCode == 123, right = event.keyCode == 124
             // The list only moves vertically; the grid moves in both directions.
