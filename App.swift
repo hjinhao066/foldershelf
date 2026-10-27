@@ -234,11 +234,22 @@ struct StorageBarView: View {
 // MARK: - Quick Look (space bar)
 
 enum PreviewNav {
+    /// Index `delta` rows away from `index`, clamped to 0..<count. With no current row,
+    /// moving forward lands on the first row and moving back on the last.
+    static func move(from index: Int?, count: Int, delta: Int) -> Int {
+        guard count > 0 else { return 0 }
+        guard let i = index else { return delta >= 0 ? 0 : count - 1 }
+        return min(max(i + delta, 0), count - 1)
+    }
+
     /// Next/previous index in a list of `count` rows, clamped at both ends.
     static func step(from index: Int?, count: Int, forward: Bool) -> Int {
-        guard count > 0 else { return 0 }
-        guard let i = index else { return forward ? 0 : count - 1 }
-        return min(max(i + (forward ? 1 : -1), 0), count - 1)
+        move(from: index, count: count, delta: forward ? 1 : -1)
+    }
+
+    /// Columns of the adaptive icon grid (min item width 75, spacing 12, padding 16 each side).
+    static func gridColumns(width: CGFloat) -> Int {
+        max(1, Int((width - 32 + 12) / (75 + 12)))
     }
 }
 
@@ -255,7 +266,8 @@ final class PreviewController: NSObject, QLPreviewPanelDataSource, QLPreviewPane
     private var panel: QLPreviewPanel? {
         QLPreviewPanel.sharedPreviewPanelExists() ? QLPreviewPanel.shared() : nil
     }
-    var isVisible: Bool { panel?.isVisible ?? false }
+    /// Alpha 0 counts as closed: see close() for why the panel is sometimes only hidden that way.
+    var isVisible: Bool { (panel?.isVisible ?? false) && (panel?.alphaValue ?? 0) > 0 }
     func owns(_ window: NSWindow?) -> Bool { window != nil && window === panel }
 
     func show(_ urls: [URL], host: NSWindow?) {
@@ -264,6 +276,8 @@ final class PreviewController: NSObject, QLPreviewPanelDataSource, QLPreviewPane
         hostWindow = host
         panel.dataSource = self
         panel.delegate = self
+        panel.alphaValue = 1
+        panel.ignoresMouseEvents = false
         panel.hidesOnDeactivate = false      // FolderTop is never the active app
         // One level above the folder panel (.floating), so the preview sits on top of it
         // instead of underneath.
@@ -287,14 +301,16 @@ final class PreviewController: NSObject, QLPreviewPanelDataSource, QLPreviewPane
     }
 
     func close() {
+        guard isVisible, let p = panel else { urls = []; return }
+        // The shared Quick Look panel ignores close()/orderOut() while FolderTop is not the
+        // active app (it only goes away when the folder panel hides), so hide it ourselves:
+        // transparent + click-through first (instant, no animation, so no flash), then the
+        // normal orderOut. show() restores everything.
+        p.animationBehavior = .none
+        p.alphaValue = 0
+        p.ignoresMouseEvents = true
         urls = []
-        guard isVisible else { return }
-        panel?.close()
-        // The panel can ignore a close issued mid-animation; retry once if it is still up.
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self, self.urls.isEmpty, self.isVisible else { return }
-            self.panel?.orderOut(nil)
-        }
+        p.orderOut(nil)
     }
 
     /// Closes the preview unless the folder panel or the preview itself holds key focus.
@@ -833,6 +849,10 @@ struct DetailView: View {
     // the anchor, a plain click selects just one. Anchor is the last plain/cmd click.
     @State private var selectedFileIDs: Set<URL> = []
     @State private var selectionAnchorID: URL? = nil
+    // Set by keyboard navigation so the list/grid scrolls the new selection into view.
+    @State private var scrollTarget: URL? = nil
+    @State private var gridColumnCount = 1
+    private var gridStride: Int { viewMode == .grid ? gridColumnCount : 1 }
     @State private var nameWidth: CGFloat = 200   // resizable; auto-expands to fill when the window is wide
     // Persisted so the list/grid choice survives app restarts.
     @AppStorage("FolderShelfViewMode") private var viewMode: ViewMode = .list
@@ -1146,6 +1166,7 @@ struct DetailView: View {
             // scroll) when the user widens it or the window is too narrow for all columns.
             let nameW = max(nameWidth, geo.size.width - basePad - otherColumnsWidth)
             let totalW = basePad + nameW + otherColumnsWidth
+            ScrollViewReader { proxy in
             ScrollView([.horizontal, .vertical], showsIndicators: true) {
                 LazyVStack(spacing: 2, pinnedViews: [.sectionHeaders]) {
                     Section {
@@ -1184,6 +1205,10 @@ struct DetailView: View {
             .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
                 handleDrop(providers: providers, destFolder: folder)
             }
+            .onChange(of: scrollTarget) { id in
+                if let id = id { proxy.scrollTo(id) }
+            }
+            }
         }
     }
 
@@ -1208,6 +1233,7 @@ struct DetailView: View {
 
     @ViewBuilder
     func gridFilesView(folder: FolderItem) -> some View {
+        ScrollViewReader { proxy in
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 75), spacing: 12)], spacing: 16) {
                 ForEach(filteredFiles) { file in
@@ -1226,6 +1252,16 @@ struct DetailView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
             handleDrop(providers: providers, destFolder: folder)
+        }
+        .onChange(of: scrollTarget) { id in
+            if let id = id { proxy.scrollTo(id) }
+        }
+        // Track the grid's column count so up/down move by a whole row.
+        .background(GeometryReader { geo in
+            Color.clear
+                .onAppear { gridColumnCount = PreviewNav.gridColumns(width: geo.size.width) }
+                .onChange(of: geo.size.width) { w in gridColumnCount = PreviewNav.gridColumns(width: w) }
+        })
         }
     }
 
@@ -1289,15 +1325,20 @@ struct DetailView: View {
             guard preview.isVisible else { return false }
             preview.close()
             return true
-        case 123, 124, 125, 126:   // arrows move the selection while previewing
-            guard preview.isVisible else { return false }
+        case 123, 124, 125, 126:   // arrows move the selection (Finder-style)
+            let up = event.keyCode == 126, down = event.keyCode == 125
+            let left = event.keyCode == 123, right = event.keyCode == 124
+            // The list only moves vertically; the grid moves in both directions.
+            if viewMode == .list && !(up || down) { return false }
             let visible = filteredFiles
+            guard !visible.isEmpty else { return false }
+            let delta = up ? -gridStride : down ? gridStride : left ? -1 : 1
             let picked = visible.indices.filter { selectedFileIDs.contains(visible[$0].id) }
-            let forward = event.keyCode == 124 || event.keyCode == 125
-            let next = PreviewNav.step(from: forward ? picked.max() : picked.min(), count: visible.count, forward: forward)
+            let next = PreviewNav.move(from: delta > 0 ? picked.max() : picked.min(), count: visible.count, delta: delta)
             guard visible.indices.contains(next) else { return true }
             selectedFileIDs = [visible[next].id]
             selectionAnchorID = visible[next].id
+            scrollTarget = visible[next].id
             return true
         default:
             return false

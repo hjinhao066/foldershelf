@@ -32,6 +32,13 @@ func testMain(_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<C
     check(PreviewNav.step(from: nil, count: 5, forward: true) == 0, "nil forward -> first")
     check(PreviewNav.step(from: nil, count: 5, forward: false) == 4, "nil back -> last")
     check(PreviewNav.step(from: nil, count: 0, forward: true) == 0, "empty list")
+    check(PreviewNav.move(from: 5, count: 20, delta: 4) == 9, "grid down by 4 columns")
+    check(PreviewNav.move(from: 2, count: 20, delta: -4) == 0, "grid up clamps at first")
+    check(PreviewNav.move(from: 18, count: 20, delta: 4) == 19, "grid down clamps at last")
+    check(PreviewNav.move(from: nil, count: 20, delta: 4) == 0, "no selection, down -> first")
+    check(PreviewNav.move(from: nil, count: 20, delta: -1) == 19, "no selection, up -> last")
+    check(PreviewNav.gridColumns(width: 480) == 5, "gridColumns 480pt -> 5")
+    check(PreviewNav.gridColumns(width: 10) == 1, "gridColumns narrow -> 1")
 
     print(failures == 0 ? "ALL PASSED" : "\(failures) FAILED")
     return failures == 0 ? 0 : 1
