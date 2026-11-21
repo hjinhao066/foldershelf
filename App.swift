@@ -398,6 +398,7 @@ final class FolderPanel: NSPanel {
 
     override func orderOut(_ sender: Any?) {
         super.orderOut(sender)
+        HoverTooltip.shared.hide()
         // The extra async pass covers a close the Quick Look panel ignores mid-hide.
         PreviewController.shared.close()
         DispatchQueue.main.async { PreviewController.shared.close() }
@@ -1283,6 +1284,9 @@ struct DetailView: View {
                 }
                 .frame(width: totalW, alignment: .leading)
                 .padding(.vertical, 4)
+                // A two-axis ScrollView centres content smaller than the viewport, which
+                // left a blank band above short folders. Pin it to the top-left instead.
+                .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .topLeading)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
@@ -1832,7 +1836,7 @@ struct RowInteractionView: NSViewRepresentable {
         apply(to: nsView)
     }
     private func apply(to v: RowInteractionNSView) {
-        v.toolTip = toolTip
+        v.hoverText = toolTip
         v.dragURLs = dragURLs
         v.onClick = onClick
         v.onDoubleClick = onDoubleClick
@@ -1847,6 +1851,9 @@ final class RowInteractionNSView: NSView, NSDraggingSource {
     var onDoubleClick: (() -> Void)?
     var onHover: ((Bool) -> Void)?
     var menuItemsProvider: (() -> [RowMenuItem])?
+    /// Full file name, shown in HoverTooltip after the mouse rests on the row for 1.5s.
+    var hoverText: String?
+    private var hoverTimer: Timer?
 
     private var mouseDownEvent: NSEvent?
     private var trackingArea: NSTrackingArea?
@@ -1869,10 +1876,31 @@ final class RowInteractionNSView: NSView, NSDraggingSource {
         trackingArea = t
     }
 
-    override func mouseEntered(with event: NSEvent) { onHover?(true) }
-    override func mouseExited(with event: NSEvent) { onHover?(false) }
+    override func mouseEntered(with event: NSEvent) {
+        onHover?(true)
+        hoverTimer?.invalidate()
+        guard let text = hoverText, !text.isEmpty else { return }
+        hoverTimer = Timer.scheduledTimer(withTimeInterval: HoverTooltip.delay, repeats: false) { [weak self] _ in
+            guard let self = self, self.window?.isVisible == true else { return }
+            HoverTooltip.shared.show(text, near: NSEvent.mouseLocation)
+        }
+    }
+    override func mouseExited(with event: NSEvent) {
+        onHover?(false)
+        cancelHoverTooltip()
+    }
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { cancelHoverTooltip() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+    private func cancelHoverTooltip() {
+        hoverTimer?.invalidate()
+        hoverTimer = nil
+        HoverTooltip.shared.hide()
+    }
 
     override func mouseDown(with event: NSEvent) {
+        cancelHoverTooltip()
         mouseDownEvent = event
     }
 
@@ -1955,10 +1983,104 @@ struct FileIconView: View {
     }
 }
 
+// MARK: - Hover tooltip
+
+/// Small floating label for the full file name. AppKit's own toolTip only appears in the
+/// active app, and FolderTop is never active, so hovering a truncated name showed nothing.
+final class HoverTooltip {
+    static let shared = HoverTooltip()
+    static let delay: TimeInterval = 1.5
+    static let maxWidth: CGFloat = 560
+
+    private let panel: NSPanel
+    private let label: NSTextField
+
+    private init() {
+        panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: true)
+        panel.level = .popUpMenu            // above the .floating FolderTop panel
+        panel.ignoresMouseEvents = true
+        panel.hasShadow = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.isReleasedWhenClosed = false
+
+        label = NSTextField(wrappingLabelWithString: "")
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .labelColor
+        label.isSelectable = false
+
+        let bg = NSVisualEffectView()
+        bg.material = .toolTip
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 6
+        bg.layer?.masksToBounds = true
+        bg.addSubview(label)
+        panel.contentView = bg
+    }
+
+    func show(_ text: String, near mouse: NSPoint) {
+        label.stringValue = text
+        label.preferredMaxLayoutWidth = Self.maxWidth
+        let fit = label.sizeThatFits(NSSize(width: Self.maxWidth, height: .greatestFiniteMagnitude))
+        let pad = NSSize(width: 8, height: 5)
+        let size = NSSize(width: ceil(min(fit.width, Self.maxWidth)) + pad.width * 2,
+                          height: ceil(fit.height) + pad.height * 2)
+        label.frame = NSRect(x: pad.width, y: pad.height, width: size.width - pad.width * 2,
+                             height: size.height - pad.height * 2)
+        // Just below-right of the cursor, kept on the cursor's screen.
+        var origin = NSPoint(x: mouse.x + 10, y: mouse.y - 22 - size.height)
+        if let vf = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })?.visibleFrame {
+            origin.x = min(max(origin.x, vf.minX + 4), vf.maxX - size.width - 4)
+            if origin.y < vf.minY + 4 { origin.y = mouse.y + 16 }
+        }
+        panel.setFrame(NSRect(origin: origin, size: size), display: true)
+        panel.orderFrontRegardless()
+    }
+
+    func hide() {
+        if panel.isVisible { panel.orderOut(nil) }
+    }
+}
+
+// MARK: - Panel size
+
+/// The panel's size is remembered across launches (the user resizes it by dragging an edge).
+enum PanelSize {
+    static let key = "FolderTopPanelSize"
+    static let defaultSize = NSSize(width: 960, height: 540)
+    static let minSize = NSSize(width: 560, height: 360)
+
+    static func load(_ d: UserDefaults = .standard) -> NSSize {
+        if let raw = d.string(forKey: key) {
+            let s = NSSizeFromString(raw)
+            if s.width >= minSize.width && s.height >= minSize.height { return s }
+        }
+        return defaultSize
+    }
+    static func save(_ size: NSSize, _ d: UserDefaults = .standard) {
+        d.set(NSStringFromSize(NSSize(width: size.width.rounded(), height: size.height.rounded())), forKey: key)
+    }
+    /// Shrink (never grow) to fit a screen's visible area, e.g. on the smaller laptop screen.
+    static func fit(_ size: NSSize, in visible: NSRect) -> NSSize {
+        NSSize(width: min(size.width, visible.width), height: min(size.height, visible.height))
+    }
+}
+
 // MARK: - App Window Delegate
 
 class WindowDelegate: NSObject, NSWindowDelegate {
     var onFocusLost: (() -> Void)?
+    /// Set while we resize the panel ourselves (placement/screen fit) so only the
+    /// user's own resizes are remembered.
+    var isProgrammaticResize = false
+
+    func windowDidResize(_ notification: Notification) {
+        guard !isProgrammaticResize, let w = notification.object as? NSWindow else { return }
+        PanelSize.save(w.frame.size)
+    }
     
     func windowDidResignKey(_ notification: Notification) {
         PreviewController.shared.closeIfFocusLost()
@@ -2003,7 +2125,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func createWindow() {
         let window = FolderPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 660, height: 440),
+            contentRect: NSRect(origin: .zero, size: PanelSize.load()),
             styleMask: [.borderless, .resizable, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -2041,11 +2163,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = hostingView
         
         // Align with the visible area of the primary screen (snugly under the status bar / menu bar)
+        window.minSize = PanelSize.minSize
         if let screen = NSScreen.main {
             let visibleRect = screen.visibleFrame
-            let x = visibleRect.origin.x + (visibleRect.width - 660) / 2
-            let y = visibleRect.origin.y + visibleRect.height - 440
-            window.setFrame(NSRect(x: x, y: y, width: 660, height: 440), display: true)
+            let size = PanelSize.fit(PanelSize.load(), in: visibleRect)
+            let x = visibleRect.origin.x + (visibleRect.width - size.width) / 2
+            let y = visibleRect.origin.y + visibleRect.height - size.height
+            windowDelegate.isProgrammaticResize = true
+            window.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+            windowDelegate.isProgrammaticResize = false
         }
         
         self.window = window
@@ -2105,12 +2231,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Keep the user's resized panel dimensions (the panel is .resizable);
         // only re-anchor it to the top-center of the target screen.
-        let size = window.frame.size
+        // Use the remembered size, shrunk to fit if this screen is smaller.
         let visibleRect = screen.visibleFrame
+        let size = PanelSize.fit(PanelSize.load(), in: visibleRect)
         let x = visibleRect.origin.x + (visibleRect.width - size.width) / 2
         let y = visibleRect.origin.y + visibleRect.height - size.height
 
+        windowDelegate.isProgrammaticResize = true
         window.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: false)
+        windowDelegate.isProgrammaticResize = false
         window.level = .floating
         // Show the panel above the active app WITHOUT activating FolderShelf, so
         // the menu bar / Ice stay interactive and a fullscreen app is not kicked out.

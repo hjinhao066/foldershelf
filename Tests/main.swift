@@ -74,6 +74,15 @@ func testMain(_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<C
     d.set(UUID().uuidString, forKey: AppStore.selectedWorkspaceKey)
     st = AppStore(defaults: d)
     check(st.selectedWorkspaceID == study.id, "stale workspace id -> falls back to 学习")
+    // PanelSize
+    check(PanelSize.load(d) == PanelSize.defaultSize, "no saved size -> default \(PanelSize.defaultSize)")
+    PanelSize.save(NSSize(width: 1200.4, height: 610.6), d)
+    check(PanelSize.load(d) == NSSize(width: 1200, height: 611), "saved size round-trips (rounded)")
+    PanelSize.save(NSSize(width: 100, height: 100), d)
+    check(PanelSize.load(d) == PanelSize.defaultSize, "too-small saved size ignored")
+    let laptop = NSRect(x: 0, y: 0, width: 1000, height: 500)
+    check(PanelSize.fit(NSSize(width: 1200, height: 611), in: laptop) == NSSize(width: 1000, height: 500), "fit shrinks to small screen")
+    check(PanelSize.fit(NSSize(width: 800, height: 400), in: laptop) == NSSize(width: 800, height: 400), "fit never grows")
     d.removePersistentDomain(forName: suite)
 
     print(failures == 0 ? "ALL PASSED" : "\(failures) FAILED")
