@@ -49,6 +49,33 @@ func testMain(_ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<C
     check(!PreviewNav.isInsideTable(NSView()), "plain view is not a table")
     check(!PreviewNav.isInsideTable(nil), "nil responder is not a table")
 
+    // AppStore selection memory (isolated defaults suite, never the real app's prefs)
+    let suite = "foldertop.tests.\(UUID().uuidString)"
+    let d = UserDefaults(suiteName: suite)!
+    let dl = FolderItem(path: "/tmp/dl", displayName: "Downloads")
+    let cv = FolderItem(path: "/tmp/cv", displayName: "简历通稿")
+    let study = Workspace(name: "学习 (Study)", folders: [dl, cv])
+    let work = Workspace(name: "工作 (Work)", folders: [FolderItem(path: "/tmp/w", displayName: "w")])
+    d.set(try! JSONEncoder().encode([work, study]), forKey: "FolderShelfWorkspaces")
+    var st = AppStore(defaults: d)
+    check(st.selectedWorkspaceID == study.id, "nothing remembered -> opens 学习 even if not first")
+    check(st.selectedFolderID == dl.id, "nothing remembered -> first folder (Downloads)")
+    st.selectedFolderID = cv.id
+    st.selectWorkspace(work.id)
+    check(st.selectedFolderID == work.folders[0].id, "switching workspace opens its first folder")
+    st.selectWorkspace(study.id)
+    check(st.selectedFolderID == cv.id, "switching back reopens last folder in that workspace")
+    st.selectWorkspace(work.id)
+    st = AppStore(defaults: d)
+    check(st.selectedWorkspaceID == work.id, "relaunch reopens last workspace (tab click alone persisted)")
+    st.selectWorkspace(study.id)
+    st = AppStore(defaults: d)
+    check(st.selectedFolderID == cv.id, "relaunch reopens last folder")
+    d.set(UUID().uuidString, forKey: AppStore.selectedWorkspaceKey)
+    st = AppStore(defaults: d)
+    check(st.selectedWorkspaceID == study.id, "stale workspace id -> falls back to 学习")
+    d.removePersistentDomain(forName: suite)
+
     print(failures == 0 ? "ALL PASSED" : "\(failures) FAILED")
     return failures == 0 ? 0 : 1
 

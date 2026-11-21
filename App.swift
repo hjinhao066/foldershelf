@@ -154,6 +154,10 @@ extension View {
     func iconHover() -> some View { modifier(IconHover()) }
 }
 
+/// True while the 添加本地文件夹 open panel is up: the panel must not auto-hide when the
+/// mouse moves onto the dialog.
+var isAddFolderDialogOpen = false
+
 func isMouseInsideWindow() -> Bool {
     guard let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "FolderShelfWindow" }),
           window.isVisible else { return false }
@@ -452,10 +456,21 @@ struct HairlineV: View {
 
 class AppStore: ObservableObject {
     @Published var workspaces: [Workspace] = []
-    @Published var selectedWorkspaceID: UUID?
-    @Published var selectedFolderID: UUID?
-    
-    init() {
+    // Both selections are written to disk the moment they change, so a relaunch reopens
+    // exactly where the user left off (before, only add/remove saved, so the app kept
+    // reopening whatever workspace was current the last time a folder was added).
+    @Published var selectedWorkspaceID: UUID? { didSet { persistSelection() } }
+    @Published var selectedFolderID: UUID? { didSet { persistSelection() } }
+    /// Last folder the user opened in each workspace (workspace UUID → folder UUID).
+    private var lastFolderByWorkspace: [String: String] = [:]
+    private var isLoading = false
+    private let defaults: UserDefaults
+
+    static let selectedWorkspaceKey = "FolderShelfSelectedWorkspaceID"
+    static let lastFolderKey = "FolderShelfLastFolderByWorkspace"
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         load()
         if workspaces.isEmpty {
             // Default workspaces: 学习, 工作, 生活
@@ -520,27 +535,57 @@ class AppStore: ObservableObject {
     
     func save() {
         if let data = try? JSONEncoder().encode(workspaces) {
-            UserDefaults.standard.set(data, forKey: "FolderShelfWorkspaces")
+            defaults.set(data, forKey: "FolderShelfWorkspaces")
         }
-        if let selectedWSID = selectedWorkspaceID {
-            UserDefaults.standard.set(selectedWSID.uuidString, forKey: "FolderShelfSelectedWorkspaceID")
+        persistSelection()
+    }
+
+    /// Switch workspace and reopen the folder last used there (else its first folder).
+    func selectWorkspace(_ id: UUID) {
+        selectedWorkspaceID = id
+        selectedFolderID = rememberedFolderID(for: id)
+    }
+
+    func rememberedFolderID(for wsID: UUID) -> UUID? {
+        guard let ws = workspaces.first(where: { $0.id == wsID }) else { return nil }
+        if let raw = lastFolderByWorkspace[wsID.uuidString], let fid = UUID(uuidString: raw),
+           ws.folders.contains(where: { $0.id == fid }) {
+            return fid
+        }
+        return ws.folders.first?.id
+    }
+
+    private func persistSelection() {
+        guard !isLoading, let wsID = selectedWorkspaceID else { return }
+        defaults.set(wsID.uuidString, forKey: Self.selectedWorkspaceKey)
+        // Only remember a folder that really belongs to the current workspace (during a
+        // workspace switch the old folder ID is briefly still set).
+        if let fid = selectedFolderID, selectedWorkspace?.folders.contains(where: { $0.id == fid }) == true {
+            lastFolderByWorkspace[wsID.uuidString] = fid.uuidString
+            defaults.set(lastFolderByWorkspace, forKey: Self.lastFolderKey)
         }
     }
-    
+
     func load() {
-        if let data = UserDefaults.standard.data(forKey: "FolderShelfWorkspaces"),
+        isLoading = true
+        defer { isLoading = false }
+        if let data = defaults.data(forKey: "FolderShelfWorkspaces"),
            let decoded = try? JSONDecoder().decode([Workspace].self, from: data) {
             workspaces = decoded
         }
-        if let wsIDString = UserDefaults.standard.string(forKey: "FolderShelfSelectedWorkspaceID"),
-           let wsID = UUID(uuidString: wsIDString) {
+        lastFolderByWorkspace = defaults.dictionary(forKey: Self.lastFolderKey) as? [String: String] ?? [:]
+        if let wsIDString = defaults.string(forKey: Self.selectedWorkspaceKey),
+           let wsID = UUID(uuidString: wsIDString),
+           workspaces.contains(where: { $0.id == wsID }) {
             selectedWorkspaceID = wsID
         } else {
-            selectedWorkspaceID = workspaces.first?.id
+            // Nothing remembered yet: start in 学习 (Study), whose first folder is Downloads.
+            selectedWorkspaceID = (workspaces.first(where: { $0.name.hasPrefix("学习") }) ?? workspaces.first)?.id
         }
-        // Auto-select the first mounted folder so launching straight into a
-        // workspace shows its files instead of the empty placeholder.
-        selectedFolderID = selectedWorkspace?.folders.first?.id
+        // Open a folder straight away so launching never lands on the empty placeholder.
+        if let wsID = selectedWorkspaceID {
+            selectedFolderID = rememberedFolderID(for: wsID)
+        }
     }
 }
 
@@ -572,8 +617,7 @@ struct MainView: View {
                         ForEach(store.workspaces) { ws in
                             WorkspaceTabView(name: ws.name,
                                              isSelected: store.selectedWorkspaceID == ws.id) {
-                                store.selectedWorkspaceID = ws.id
-                                store.selectedFolderID = ws.folders.first?.id
+                                store.selectWorkspace(ws.id)
                             }
                             .contextMenu {
                                 if store.workspaces.count > 1 {
@@ -655,9 +699,9 @@ struct MainView: View {
         .background(Theme.chrome)
         .onHover { isHovering in
             // Hide automatically when the mouse exits the window, unless pinned
-            if !isHovering && !isPinned {
+            if !isHovering && !isPinned && !isAddFolderDialogOpen {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    if !isMouseInsideWindow() {
+                    if !isMouseInsideWindow() && !isAddFolderDialogOpen {
                         if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "FolderShelfWindow" }) {
                             window.orderOut(nil)
                         }
@@ -839,16 +883,39 @@ struct SidebarView: View {
     }
     
     func addFolderDialog() {
+        // Why the first click used to "do nothing": FolderTop is an accessory app that is
+        // never active, so the open panel came up behind the frontmost app (and below our
+        // .floating panel); moving the mouse toward it then auto-hid FolderTop. The second
+        // click only worked because clicking during the hidden modal session activated the
+        // app and surfaced the dialog. Fix: activate for the dialog, put it above the
+        // floating panel, keep the panel up meanwhile, then hand focus back.
+        let previousApp = NSWorkspace.shared.frontmostApplication
+        isAddFolderDialogOpen = true
+        defer { isAddFolderDialogOpen = false }
+
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.message = "选择要挂载到该工作区的本地文件夹"
-        if panel.runModal() == .OK {
-            if let url = panel.url {
-                let displayName = url.lastPathComponent
-                store.addFolder(path: url.path, displayName: displayName)
-            }
+        panel.level = .modalPanel
+        if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        // Without this the dialog lands on whatever screen AppKit calls "main" (often the
+        // other monitor). Centre it on the screen the FolderTop panel is on, once the
+        // modal session has placed it.
+        let panelScreen = NSApp.windows.first(where: { $0.identifier?.rawValue == "FolderShelfWindow" })?.screen
+        DispatchQueue.main.async {
+            guard let screen = panelScreen ?? NSScreen.main else { return }
+            let v = screen.visibleFrame, size = panel.frame.size
+            panel.setFrameOrigin(NSPoint(x: v.midX - size.width / 2, y: v.midY - size.height / 2))
+            panel.orderFrontRegardless()
+        }
+        let response = panel.runModal()
+        if response == .OK, let url = panel.url {
+            store.addFolder(path: url.path, displayName: url.lastPathComponent)
+        }
+        if let prev = previousApp, prev != NSRunningApplication.current {
+            prev.activate()
         }
     }
 }
