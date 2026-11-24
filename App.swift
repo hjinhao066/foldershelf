@@ -1385,7 +1385,29 @@ struct DetailView: View {
             selectionAnchorID = nil
             refreshFiles()
         } else {
-            NSWorkspace.shared.open(file.url)
+            Self.openBringingToFront(file.url)
+        }
+    }
+
+    /// FolderTop is never the active app, and since macOS 14 only the active app may hand
+    /// focus to another one. A plain NSWorkspace.open from here delivered the file but left
+    /// the target app in the background (under Stage Manager it just flashed in the strip).
+    /// The user just double-clicked us, so we may activate briefly, then yield focus to the
+    /// app that opens the file. (2026-11-23)
+    static func openBringingToFront(_ url: URL) {
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+            if let handler = NSWorkspace.shared.urlForApplication(toOpen: url),
+               let bid = Bundle(url: handler)?.bundleIdentifier {
+                NSApp.yieldActivation(toApplicationWithBundleIdentifier: bid)
+            }
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        NSWorkspace.shared.open(url, configuration: config) { _, error in
+            if let error { NSLog("FolderTop open failed: \(error)") }
         }
     }
 
